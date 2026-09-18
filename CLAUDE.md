@@ -114,8 +114,10 @@ credential is attached, so push fails regardless of how broad the forge token is
   Russian in parts of `pi.mjs`, `rpc.mjs`, `render.mjs`, `db.mjs`, `telemetry.mjs`, `agent-work.mjs`;
   keep the language of the file you are editing.
 - Documentation split: `README.md` is an overview only, `docs/*.md` hold the reasoning (English),
-  `skills/pi/SKILL.md` holds the working commands (Russian) and nothing else. `docs/RESEARCH-*.md`
-  and `docs/DESIGN-*.md` are research notes with their raw data in `docs/data/`.
+  `skills/pi/SKILL.md` holds the working commands (Russian) and nothing else. Research notes
+  (`RESEARCH-*.md`, `DESIGN-*.md`) and their raw data are NOT in this repository: they live in the
+  agents home, `~/.agents/docs/LLM/`, together with the working backlog — they are working notes,
+  not product documentation, and they are shared with the neighbouring `llm-workflow` repository.
 - User-facing output is Markdown built in `lib/render.mjs`; commands return
   `output(rendered, payload, asJson)` so every command has a `--json` form.
 - Errors prefer refusing over guessing whenever a wrong guess costs a paid run (unknown flag,

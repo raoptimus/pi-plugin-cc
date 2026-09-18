@@ -72,4 +72,4 @@ Each request is recorded as one row: status, `error_kind` (`transport`, `timeout
 
 What is never recorded: messages, system prompts, tool definitions, response text, or request headers. The body is parsed a few lines away to rewrite the model name, so this is a discipline rather than a limitation — the same line `redactArgs` draws for command lines. Rows expire with the same 90-day retention.
 
-Design notes and the measurements behind all of this: [DESIGN-proxy-telemetry.md](DESIGN-proxy-telemetry.md), [RESEARCH-provider-tps.md](RESEARCH-provider-tps.md) (both in Russian).
+Design notes and the measurements behind all of this live in the agents home: `~/.agents/docs/LLM/DESIGN-proxy-telemetry.md` and `~/.agents/docs/LLM/RESEARCH-provider-tps.md` (both in Russian).
