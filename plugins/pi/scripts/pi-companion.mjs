@@ -273,6 +273,9 @@ const RUN_FLAGS = {
     // Continue a session whose provider cache has aged out, paying for the
     // whole history again on purpose.
     "stale-ok",
+    // Refuse the fallback swap for this run: measuring a provider or debugging
+    // it needs the run to die where it was aimed, not quietly move elsewhere.
+    "no-fallback",
     "stdin",
     "no-tools",
     "no-builtin-tools",
@@ -405,6 +408,7 @@ function usage() {
     "  --provider <name>       provider name",
     "  --thinking <level>      off|minimal|low|medium|high|xhigh|max",
     "  --preset <name>         preset from .claude/pi/config.json",
+    "  --no-fallback           keep the named preset even if the journal calls it dead",
     "  --system-prompt <v>     stored prompt name (reviewer, fixer, …), @path/to.md, or inline text",
     "  --append-system-prompt  additive prompt text or file (repeatable)",
     "  --read-only             restrict pi to reading: read, grep, find, ls + LSP navigation",
@@ -1352,6 +1356,15 @@ async function applyFallbackPreset({ command, flags, workspaceRoot, runRoot, con
   }
   const swap = resolvePresetFallback({ config, presetName: settings.presetName, runs });
   if (!swap) {
+    return settings;
+  }
+  if (flags["no-fallback"]) {
+    // Silence would read as "the preset was healthy": name the swap that did
+    // not happen so the caller knows why the run is about to die where it did.
+    settings.warnings.push(
+      `Preset \`${settings.presetName}\` last failed on ${swap.dead.kind} ("${swap.dead.text.slice(0, 120)}") — ` +
+        `fallback to \`${swap.preset}\` suppressed by \`--no-fallback\`.`
+    );
     return settings;
   }
   const swapped = buildRunSettings({

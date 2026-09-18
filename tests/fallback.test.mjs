@@ -224,12 +224,12 @@ function seedFailure(dbFile, preset, text) {
   }
 }
 
-function runDelegate({ home, workspace, dbFile, preset }) {
+function runDelegate({ home, workspace, dbFile, preset, extra = [] }) {
   const log = path.join(workspace, "pi-calls.jsonl");
   fs.writeFileSync(log, "", "utf8");
   const result = spawnSync(
     process.execPath,
-    [CLI, "delegate", "--preset", preset, "сделай задачу", "--engine", "json"],
+    [CLI, "delegate", "--preset", preset, ...extra, "сделай задачу", "--engine", "json"],
     {
       cwd: workspace,
       encoding: "utf8",
@@ -280,6 +280,52 @@ test("живой пресет не подменяется: задача стар
   assert.equal(result.status, 0, `CLI завершился успешно:\n${result.stderr}`);
   const args = calls().at(-1).args;
   assert.equal(args[args.indexOf("--provider") + 1], "deepseek", "без отказа в журнале подмены нет");
+});
+
+test("--no-fallback держит заявленный пресет, каким бы мёртвым он ни числился", () => {
+  const home = makeHome();
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fallback-ws-"));
+  const dbFile = path.join(workspace, "jobs.db");
+  seedFailure(dbFile, "go-developer-deepseek", "Error 402: Insufficient Balance");
+
+  const { result, calls } = runDelegate({
+    home,
+    workspace,
+    dbFile,
+    preset: "go-developer-deepseek",
+    extra: ["--no-fallback"]
+  });
+  assert.equal(result.status, 0, `CLI завершился успешно:\n${result.stderr}`);
+  const args = calls().at(-1).args;
+  assert.equal(args[args.indexOf("--provider") + 1], "deepseek", "стартовал запрошенный провайдер, не кандидат");
+  assert.equal(args[args.indexOf("--model") + 1], "deepseek-chat", "стартовала модель запрошенного пресета");
+  // Причина, по которой прогон не уехал, названа одной строкой, а не замалчивается.
+  assert.match(result.stdout, /--no-fallback/);
+  assert.match(result.stdout, /go-developer-zai/);
+
+  // В журнал уходит именно тот, кого запускали.
+  const handle = openDatabase(dbFile);
+  const rows = queryPresetHealth(handle);
+  handle.close();
+  assert.equal(rows[0].preset, "go-developer-deepseek");
+});
+
+test("--no-fallback на живом пресете не меняет поведение", () => {
+  const home = makeHome();
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fallback-ws-"));
+  const dbFile = path.join(workspace, "jobs.db");
+
+  const { result, calls } = runDelegate({
+    home,
+    workspace,
+    dbFile,
+    preset: "go-developer-deepseek",
+    extra: ["--no-fallback"]
+  });
+  assert.equal(result.status, 0, `CLI завершился успешно:\n${result.stderr}`);
+  const args = calls().at(-1).args;
+  assert.equal(args[args.indexOf("--provider") + 1], "deepseek");
+  assert.doesNotMatch(result.stdout, /--no-fallback/, "о подмене, которой не было, строк нет");
 });
 
 test.after(() => {
