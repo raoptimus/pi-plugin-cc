@@ -28,6 +28,7 @@ Two fields deserve naming separately, because decisions live in them rather than
 
 - **`timeoutMs`** — hard limit of a run in milliseconds (1,800,000 — half an hour — by default). It stops both pi and the container, and it is also the ceiling for auto-continuation after a truncated answer: the clock covers the whole run rather than restarting per continuation.
 - **`sandbox`** — `"docker"`, `"none"`, the name of a profile from `sandboxProfiles`, or an object. In object form `{"profile": "go", …}` the profile is the base and the remaining fields amend it: equipment (`mounts`, `env`, `args`, `extensions`, `skills`) adds to the profile's, decisions (`image`, `network`, `memory`, `cpus`) replace it. A profile may name another profile; a cycle is an error, not a hang.
+- **`fallbackPreset`** — where `delegate` turns when this preset is dead. A preset counts as dead when its most recent journaled run failed on the provider — an exhausted balance or quota, or a network outage; a full slot pool and an unidentified refusal keep the preset in place. The rest of the chain is derived from the name (`<stack>-<role>-<provider>`): presets serving the same stack and role through a different provider, tried in name order, and a success at any point puts the preset back into service. The journal lives with the plugin's own state, so the swap works on any machine the plugin is installed on.
 
 ```json
 "presets": {

@@ -116,6 +116,7 @@ import {
   databasePath,
   openDatabase,
   pruneJournalText,
+  queryPresetHealth,
   queryRun,
   queryRuns,
   queryStats,
@@ -123,6 +124,7 @@ import {
   recordJobSafely,
   DEFAULT_TEXT_TTL_DAYS
 } from "./lib/db.mjs";
+import { resolvePresetFallback } from "./lib/fallback.mjs";
 
 const PLUGIN_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 
@@ -1323,6 +1325,53 @@ async function commandSessions(argv, workspaceRoot) {
   return 0;
 }
 
+/**
+ * Swap a dead preset for the first live one of its fallback chain.
+ *
+ * The state of a preset comes from this plugin's own run journal, so the swap
+ * works on any machine the plugin is installed on. An unreadable journal means
+ * no substitution, exactly the behaviour the plugin had before: recording is
+ * best-effort everywhere else, and dispatch must not depend on it either.
+ *
+ * @returns {Promise<object>} settings, possibly re-resolved onto another preset
+ */
+async function applyFallbackPreset({ command, flags, workspaceRoot, runRoot, config, trusted, settings }) {
+  if (!settings.presetName) {
+    return settings;
+  }
+  const handle = openDatabase();
+  let runs = [];
+  if (handle) {
+    try {
+      runs = queryPresetHealth(handle);
+    } catch {
+      runs = [];
+    } finally {
+      handle.close();
+    }
+  }
+  const swap = resolvePresetFallback({ config, presetName: settings.presetName, runs });
+  if (!swap) {
+    return settings;
+  }
+  const swapped = buildRunSettings({
+    command,
+    flags: { ...flags, preset: swap.preset },
+    workspaceRoot,
+    runRoot,
+    config,
+    trusted
+  });
+  // The swap must be visible, not just happen: the caller chose a preset and
+  // got another one, and the reason quotes the refusal so the report explains
+  // the switch without a second lookup.
+  swapped.warnings.push(
+    `Preset \`${settings.presetName}\` last failed on ${swap.dead.kind} ("${swap.dead.text.slice(0, 120)}") — ` +
+      `running on \`${swap.preset}\` instead.`
+  );
+  return swapped;
+}
+
 async function commandDelegate(argv, workspaceRoot) {
   const { flags, positional } = parseArgs(argv, RUN_FLAGS);
   // A detached run gets the text its parent already assembled: re-reading stdin
@@ -1337,13 +1386,22 @@ async function commandDelegate(argv, workspaceRoot) {
 
   const { config, warnings: configWarnings } = loadConfig(workspaceRoot);
   const runRoot = resolveRunRoot(flags.cwd);
-  const settings = buildRunSettings({
+  let settings = buildRunSettings({
     command: "delegate",
     flags,
     workspaceRoot,
     runRoot,
     config,
     trusted: workspaceIsTrusted(runRoot)
+  });
+  settings = await applyFallbackPreset({
+    command: "delegate",
+    flags,
+    workspaceRoot,
+    runRoot,
+    config,
+    trusted: workspaceIsTrusted(runRoot),
+    settings
   });
   // Anything the project layer was not allowed to set has to be visible: a
   // silently ignored setting looks exactly like one that did not work.

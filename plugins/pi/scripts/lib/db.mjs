@@ -231,6 +231,7 @@ function addMissingColumns(db) {
     // was given, what it answered, and the settings it ran under.
     ["prompt", "TEXT"],
     ["result_text", "TEXT"],
+    ["error_text", "TEXT"],
     ["settings", "TEXT"],
     // Rolled up from `requests` when the run ends, so the reports keep reading
     // one table instead of joining per row.
@@ -394,6 +395,7 @@ const COLUMNS = [
   "updated_at",
   "prompt",
   "result_text",
+  "error_text",
   "settings",
   "req_count",
   "req_failed",
@@ -411,6 +413,7 @@ const COLUMNS = [
 
 /** Ceiling on any single stored text field. */
 const MAX_TEXT_CHARS = 32 * 1024;
+const MAX_ERROR_CHARS = 2000;
 
 /**
  * How long the journal keeps the text of a run.
@@ -489,6 +492,12 @@ export function jobToRow(job) {
     // outlives the run, the temp directory and the reboot.
     prompt: forJournal(job.prompt ?? null, MAX_TEXT_CHARS),
     result_text: forJournal(job.text ?? null, MAX_TEXT_CHARS),
+    // Thrown failures carry their reason only in `errorMessage`, which the job
+    // file keeps but the journal would otherwise not: the fallback-preset
+    // dispatch reads this column to tell a dead provider from any other
+    // failure. Capped tightly — an error message is a quote of the provider,
+    // not content worth archiving.
+    error_text: forJournal(job.errorMessage ?? null, MAX_ERROR_CHARS),
     settings: job.rerunSettings ? forJournal(JSON.stringify(job.rerunSettings), MAX_TEXT_CHARS) : null,
     req_count: job.proxyStats?.count ?? 0,
     req_failed: job.proxyStats?.failed ?? 0,
@@ -806,6 +815,22 @@ export function queryRuns(handle, { limit = 20, days = null, workspace = null, m
        LIMIT $limit`
     )
     .all({ ...params, limit: Math.max(1, Math.floor(limit)) });
+}
+
+/**
+ * Recent runs with their refusal texts, newest first — the input for deciding
+ * which presets are currently dead. Reads the envelope plus the two text
+ * columns the classification needs; prompts stay out of the result.
+ */
+export function queryPresetHealth(handle, { days = 2, limit = 500 } = {}) {
+  return handle.db
+    .prepare(
+      `SELECT preset, status, error_text, result_text, created_at
+       FROM jobs ${whereWithinDays(days)}
+       ORDER BY created_at DESC
+       LIMIT $limit`
+    )
+    .all({ limit: Math.max(1, Math.floor(limit)) });
 }
 
 /** One run in full, by id or by the tail of one. */
