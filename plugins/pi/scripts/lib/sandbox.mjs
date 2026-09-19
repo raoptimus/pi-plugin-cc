@@ -1072,6 +1072,16 @@ export function describeSlotUsage(sandbox) {
  * @returns {Promise<{waitedMs: number, slots: number|null}>}
  */
 export async function awaitSandboxSlot(sandbox, { timeoutMs = 900_000, onProgress = null, pollMs = 2000 } = {}) {
+  // Variant selection already claimed this slot while choosing among a role's
+  // pools; re-queuing here would deadlock on our own reservation, so hand it
+  // through untouched.
+  if (sandbox?.heldSlot) {
+    return {
+      waitedMs: sandbox.heldSlot.waitedMs ?? 0,
+      slots: sandbox.heldSlot.slots ?? null,
+      release: sandbox.heldSlot.release ?? (() => {})
+    };
+  }
   const limit = slotLimitOf(sandbox);
   // Slots belong to a pool when the profile names one, and to the profile
   // otherwise. A pool is what a shared provider needs: several profiles hitting
@@ -1118,6 +1128,42 @@ export function removeSandboxContainer(containerName) {
     return false;
   }
   return runCommand("docker", ["rm", "-f", containerName]).status === 0;
+}
+
+/**
+ * Pick among the variants of one role and claim a slot for the winner.
+ *
+ * A busy pool used to mean queuing even when the same role had a live variant
+ * on another account. Now each candidate in priority order gets at most
+ * `poolWaitMs` (0: take it only if free right now); when every variant is busy
+ * past its threshold, fall back to waiting for the first by priority — saying
+ * out loud what is being waited for, since a silent queue reads as a hang.
+ *
+ * Variants must arrive in priority order (`buildVariants` sorts them); the
+ * returned `sandbox` carries a `heldSlot` so `awaitSandboxSlot` inside the
+ * engine hands the claim through instead of queuing again.
+ */
+export async function awaitVariantSlot(variants, { poolWaitMs = 30_000, timeoutMs = 900_000, onProgress = null, pollMs = 2000 } = {}) {
+  if (!Array.isArray(variants) || !variants.length) {
+    throw new Error("No pool variants to choose from.");
+  }
+  const describe = (variant) => `variant "${variant.variantName}" of pool "${variant.poolName}"`;
+  for (const candidate of variants) {
+    try {
+      const slot = await awaitSandboxSlot(candidate.sandbox, { timeoutMs: Math.max(poolWaitMs, 0), pollMs });
+      return { ...slot, ...candidate, sandbox: { ...candidate.sandbox, heldSlot: slot } };
+    } catch {
+      // This pool stayed busy past the threshold — the next variant of the
+      // same role may be free right now, which is the whole point.
+    }
+  }
+  const first = variants[0];
+  onProgress?.({
+    phase: "starting",
+    message: `Every variant of the role is busy; waiting for ${describe(first)} (first by priority).`
+  });
+  const slot = await awaitSandboxSlot(first.sandbox, { timeoutMs, onProgress, pollMs });
+  return { ...slot, ...first, sandbox: { ...first.sandbox, heldSlot: slot } };
 }
 
 export function listSandboxContainers() {

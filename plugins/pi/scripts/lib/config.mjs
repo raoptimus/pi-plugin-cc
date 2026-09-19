@@ -46,7 +46,13 @@ const BUILT_IN = {
   // Named slot pools: `{"ollama-pro": 3}` means every profile that declares
   // `"concurrencyGroup": "ollama-pro"` draws from the same three slots. Optional
   // — a profile can also cap itself with `maxConcurrent` and share nothing.
+  // A pool may also be a full object: `{limit, sandbox, priority, models,
+  // default}` — the models being named variants (`fast`, `smart`) so a preset
+  // picks one of them instead of restating model/thinking per provider.
   concurrencyPools: {},
+  // How long a run is willing to wait for a busy pool before moving on to the
+  // next variant of the same role; 0 means "only a pool free right now".
+  poolWaitMs: 30_000,
   // How long a provider is assumed to keep a cached prompt. A continued
   // session replays its whole history: inside this window the provider reads
   // it from cache, past it the same tokens are billed again at the input rate.
@@ -61,6 +67,56 @@ const BUILT_IN = {
     review: { systemPrompt: "reviewer", readOnly: true }
   }
 };
+
+/**
+ * Read one `concurrencyPools` entry.
+ *
+ * The historical shape is a bare number of slots; it still reads as `{limit}`.
+ * A full pool object carries the same limit plus the provider half of the
+ * sandbox (`sandbox`), a `priority`, and named model variants under `models`.
+ */
+export function normalizeConcurrencyPool(value, name = "pool") {
+  if (typeof value === "number") {
+    return { limit: value };
+  }
+  if (!isPlainObject(value)) {
+    throw new Error(
+      `Concurrency pool "${name}" must be a number of slots or an object with a "limit", got ${JSON.stringify(value) ?? "undefined"}.`
+    );
+  }
+  const limit = Number(value.limit);
+  if (!Number.isFinite(limit) || limit <= 0) {
+    throw new Error(`Concurrency pool "${name}" needs a positive "limit", got ${JSON.stringify(value.limit ?? null)}.`);
+  }
+  return value;
+}
+
+/**
+ * Find a preset by name, or by its historical `<role>-<pool>` alias.
+ *
+ * The old compound names are contracts with the skills of a neighbouring
+ * repository — briefs, hooks and texts spell them out — so `python-developer-zai`
+ * keeps working: when the exact name is unknown, the tail after the last dash
+ * is read as a pool pin on the role preset that lists that pool.
+ */
+export function resolvePresetReference(config, name) {
+  const presets = config.presets ?? {};
+  if (presets[name]) {
+    return { preset: presets[name], presetName: name, requestedName: name, poolPin: null };
+  }
+  // Pool names may contain dashes themselves, so the split point is not the
+  // last dash: match "<preset>-<pool>" against the pools each role lists.
+  for (const [base, preset] of Object.entries(presets)) {
+    if (!preset || !Array.isArray(preset.pools) || !name.startsWith(`${base}-`)) {
+      continue;
+    }
+    const tail = name.slice(base.length + 1);
+    if (preset.pools.some((entry) => String(entry).split(":")[0] === tail)) {
+      return { preset, presetName: base, requestedName: name, poolPin: tail };
+    }
+  }
+  return null;
+}
 
 export function userConfigPath() {
   return path.join(os.homedir(), USER_CONFIG_RELATIVE);
@@ -187,6 +243,7 @@ export function mergeConfigLayer(base, layer) {
     presets: mergeNamed(base.presets, layer.presets),
     sandboxProfiles: mergeNamed(base.sandboxProfiles, layer.sandboxProfiles),
     concurrencyPools: { ...base.concurrencyPools, ...(isPlainObject(layer.concurrencyPools) ? layer.concurrencyPools : {}) },
+    poolWaitMs: layer.poolWaitMs ?? base.poolWaitMs,
     cacheTtl: mergeEntry(base.cacheTtl ?? {}, isPlainObject(layer.cacheTtl) ? layer.cacheTtl : {}),
     gitProxy: mergeNamed(base.gitProxy ?? {}, layer.gitProxy),
     commands: mergeNamed(base.commands, layer.commands)
@@ -464,12 +521,15 @@ export function loadConfig(workspaceRoot) {
  */
 export function resolveRunSettings(config, command, overrides = {}) {
   const commandDefaults = config.commands?.[command] ?? {};
-  const presetName = overrides.preset ?? commandDefaults.preset ?? null;
+  const requestedPreset = overrides.preset ?? commandDefaults.preset ?? null;
+  let presetName = requestedPreset;
   let preset = {};
 
+  let requestedName = presetName;
+  let poolPin = null;
   if (presetName) {
-    preset = config.presets?.[presetName] ?? null;
-    if (!preset) {
+    const reference = resolvePresetReference(config, presetName);
+    if (!reference) {
       const available = Object.keys(config.presets ?? {});
       throw new Error(
         available.length
@@ -477,6 +537,10 @@ export function resolveRunSettings(config, command, overrides = {}) {
           : `Unknown preset "${presetName}". No presets are configured; add one to ${userConfigPath()}.`
       );
     }
+    preset = reference.preset;
+    presetName = reference.presetName;
+    requestedName = reference.requestedName;
+    poolPin = reference.poolPin;
   }
 
   const pick = (key) => {
@@ -525,6 +589,10 @@ export function resolveRunSettings(config, command, overrides = {}) {
 
   return {
     presetName,
+    // What the caller asked for, kept apart from what was resolved: `rerun`
+    // repeats the request, while the job record shows the preset that ran.
+    requestedPresetName: requestedName,
+    presetPool: poolPin,
     model: pick("model"),
     provider: pick("provider"),
     thinking: pick("thinking"),

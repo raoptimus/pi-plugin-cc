@@ -16,7 +16,15 @@ import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import { allPresetCapabilities } from "./lib/capabilities.mjs";
-import { loadConfig, resolveRunSettings, userConfigPath, workspaceIsTrusted } from "./lib/config.mjs";
+import {
+  concatAdditive,
+  loadConfig,
+  normalizeConcurrencyPool,
+  resolvePresetReference,
+  resolveRunSettings,
+  userConfigPath,
+  workspaceIsTrusted
+} from "./lib/config.mjs";
 import {
   captureTreeSnapshot,
   collectReviewContext,
@@ -64,6 +72,7 @@ import {
 import { renderTranscriptEvent } from "./lib/transcript.mjs";
 import {
   attachMounts,
+  awaitVariantSlot,
   buildSandboxImage,
   cleanupCredentialSlices,
   containerNameForJob,
@@ -542,6 +551,10 @@ function resolveSessionReference(workspaceRoot, reference) {
 /**
  * Turn parsed flags + config into the concrete settings of one run.
  */
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
 export function buildRunSettings({ command, flags, workspaceRoot, runRoot = workspaceRoot, config, trusted = true }) {
   const overrides = {
     model: flags.model ?? null,
@@ -593,6 +606,24 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
     settings.git = resolveCommitIdentity(runRoot) ?? settings.git;
   }
   const prompt = buildSystemPrompt({ pluginRoot: PLUGIN_ROOT, workspaceRoot, config, settings });
+
+  // A preset listing pools runs as one of several variants; resolve them here
+  // so everything downstream (prompt, sandbox, warnings) sees a shaped
+  // settings object, while the actual variant is picked later, at slot time.
+  const poolPreset = settings.presetName ? config.presets?.[settings.presetName] : null;
+  const poolPlan = buildVariants(poolPreset, config, {
+    poolPin: settings.presetPool ?? null,
+    modelWanted: flags.model ?? null
+  });
+  if (poolPlan.variants.length) {
+    // The first candidate stands in until the slot wait picks the real one:
+    // preflight, mount gaps and the label only need a sandbox shaped like the
+    // one that will run.
+    settings.sandbox = poolPlan.variants[0].sandbox;
+    settings.model = poolPlan.modelOverride;
+    settings.sandboxVariants = poolPlan.variants;
+    settings.poolWaitMs = Number(config.poolWaitMs ?? 30_000);
+  }
 
   const warnings = [];
   if (runRoot !== workspaceRoot) {
@@ -870,6 +901,31 @@ async function executeRun({
   const logFile = createJobLogFile(workspaceRoot, jobId, title);
   const eventsFile = eventsPath(workspaceRoot, jobId);
   const inboxFile = inboxPath(workspaceRoot, jobId);
+  // The variant to run as is chosen here, not in the engine: the job record
+  // must name the model that actually runs, and the credential proxy keys on
+  // it. The claimed slot travels inside the sandbox (`heldSlot`), so the
+  // engine's own queue hands it through instead of waiting twice.
+  const onProgress = createProgressReporter({
+    workspaceRoot,
+    jobId,
+    logFile,
+    stderr: Boolean(flags.background)
+  });
+  if (settings.sandboxVariants?.length) {
+    const picked = await awaitVariantSlot(settings.sandboxVariants, {
+      poolWaitMs: settings.poolWaitMs ?? 30_000,
+      timeoutMs: settings.timeoutMs,
+      onProgress
+    });
+    settings.sandbox = picked.sandbox;
+    settings.sandboxLabel = describeSandbox(picked.sandbox);
+    settings.model = settings.model ?? picked.model;
+    settings.thinking = settings.thinking ?? picked.thinking;
+    if (picked.tags?.length) {
+      settings.tags = picked.tags;
+    }
+  }
+
   const job = createJobRecord({
     id: jobId,
     kind,
@@ -902,13 +958,6 @@ async function executeRun({
 
   writeJobFile(workspaceRoot, jobId, job);
   upsertJob(workspaceRoot, job);
-
-  const onProgress = createProgressReporter({
-    workspaceRoot,
-    jobId,
-    logFile,
-    stderr: Boolean(flags.background)
-  });
 
   for (const warning of settings.warnings) {
     onProgress({ message: `Warning: ${warning}` });
@@ -1135,14 +1184,120 @@ export function applyConcurrencyPool(sandbox, config) {
   if (!group) {
     return sandbox;
   }
-  const limit = Number(config?.concurrencyPools?.[group]);
-  if (!Number.isFinite(limit) || limit <= 0) {
+  const raw = config?.concurrencyPools?.[group];
+  if (raw == null) {
     throw new Error(
       `Sandbox profile references concurrency pool "${group}", which is not defined. ` +
         `Add "concurrencyPools": {"${group}": <slots>} to the config, or drop concurrencyGroup.`
     );
   }
-  return { ...sandbox, maxConcurrent: limit };
+  return { ...sandbox, maxConcurrent: Number(normalizeConcurrencyPool(raw, group).limit) };
+}
+
+/**
+ * Expand a preset's `pools` list into the concrete variants it may run as.
+ *
+ * A pool entry is `"<pool>"` or `"<pool>:<variant>"`; the pool carries the
+ * provider half of the sandbox and the slot quota, the named variant carries
+ * model and thinking, and the preset's own `requires` names the capability the
+ * profile must provide — the two halves join into one profile name
+ * (`pool.sandbox` + `requires`, dashed). Model and thinking therefore live in
+ * exactly one place per account, instead of being restated per provider in
+ * thirty presets that drift apart silently.
+ *
+ * `poolPin` (from a `<role>-<pool>` alias) and `modelWanted` (a `--model`
+ * naming a variant or a full model id) address one variant directly, skipping
+ * the busy-pool skipping — otherwise a concrete model could not be debugged.
+ * A `--model` matching nothing stays a literal override and rides the variant
+ * that wins the slot race (`modelOverride`).
+ */
+export function buildVariants(preset, config, { poolPin = null, modelWanted = null } = {}) {
+  const entries = Array.isArray(preset?.pools) ? preset.pools.map(String) : [];
+  if (!entries.length) {
+    return { variants: [], modelOverride: modelWanted ?? null };
+  }
+  const pools = config.concurrencyPools ?? {};
+  const profiles = config.sandboxProfiles ?? {};
+  const requires = Array.isArray(preset.requires) ? preset.requires.map(String) : [];
+  const variants = [];
+  for (const entry of entries) {
+    const separator = entry.indexOf(":");
+    const poolName = separator === -1 ? entry : entry.slice(0, separator);
+    const wanted = separator === -1 ? null : entry.slice(separator + 1);
+    if (pools[poolName] == null) {
+      const known = Object.keys(pools);
+      throw new Error(
+        `Preset references concurrency pool "${poolName}", which is not defined.` +
+          (known.length ? ` concurrencyPools knows: ${known.join(",")}.` : "")
+      );
+    }
+    const pool = normalizeConcurrencyPool(pools[poolName], poolName);
+    const models = isPlainObject(pool.models) ? pool.models : {};
+    const names = Object.keys(models);
+    // A --model naming a variant of this pool — by variant name or by full
+    // model id — reaches it directly, past the entry's own default.
+    const addressedName =
+      modelWanted && (models[modelWanted] ? modelWanted : names.find((name) => models[name].model === modelWanted));
+    const variantName = wanted ?? addressedName ?? pool.default ?? (names.length === 1 ? names[0] : null);
+    if (!variantName) {
+      throw new Error(
+        `Pool "${poolName}" has several variants (${names.join(", ")}) and no "default"; address one as "${poolName}:<variant>".`
+      );
+    }
+    const variant = models[variantName];
+    if (!isPlainObject(variant)) {
+      throw new Error(
+        `Pool "${poolName}" has no variant "${variantName}".${names.length ? ` Known variants: ${names.join(", ")}.` : ""}`
+      );
+    }
+    const profileName = [pool.sandbox, ...requires].filter(Boolean).join("-");
+    if (!profiles[profileName]) {
+      throw new Error(
+        `Pool "${poolName}" with requires [${requires.join(", ")}] resolves to sandbox profile "${profileName}", ` +
+          `which is not defined.${Object.keys(profiles).length ? ` sandboxProfiles knows: ${Object.keys(profiles).join(", ")}.` : ""}`
+      );
+    }
+    // Slots are counted per pool by construction: both halves of the sandbox
+    // name the same group, so variants of one account share one quota.
+    const sandbox = {
+      ...normalizeSandbox(profileName, profiles),
+      concurrencyGroup: poolName,
+      maxConcurrent: Number(pool.limit)
+    };
+    for (const key of ["env", "mounts", "skills"]) {
+      if (Array.isArray(variant[key])) {
+        sandbox[key] = concatAdditive(key, sandbox[key], variant[key]);
+      }
+    }
+    variants.push({
+      poolName,
+      variantName,
+      priority: Number(pool.priority ?? Number.POSITIVE_INFINITY),
+      model: variant.model ?? null,
+      thinking: variant.thinking ?? null,
+      tags: Array.isArray(variant.tags) ? variant.tags : [],
+      sandbox
+    });
+  }
+  let chosen = poolPin ? variants.filter((variant) => variant.poolName === poolPin) : variants;
+  let modelOverride = null;
+  if (modelWanted) {
+    const addressed = chosen.filter((variant) => variant.variantName === modelWanted || variant.model === modelWanted);
+    if (addressed.length) {
+      chosen = addressed;
+    } else {
+      modelOverride = modelWanted;
+    }
+  }
+  // Stable: equal priorities keep the preset's own listing order, so the list
+  // doubles as a tie-break and an explicit listing outranks the pool defaults.
+  return {
+    variants: chosen
+      .map((variant, index) => [variant, index])
+      .sort((a, b) => a[0].priority - b[0].priority || a[1] - b[1])
+      .map(([variant]) => variant),
+    modelOverride
+  };
 }
 
 /**
