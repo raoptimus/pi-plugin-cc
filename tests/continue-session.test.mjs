@@ -278,6 +278,44 @@ test("пустой --stdin — такой же отказ, как отсутст
   assert.equal(newCalls().length, 0, "двойник pi не стартовал");
 });
 
+/** Отсоединённый прогон пишет в лог позже возврата команды — ждём его появления. */
+function awaitCall(log, matcher, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const rows = fs.existsSync(log)
+      ? fs.readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line))
+      : [];
+    const hit = rows.find(matcher);
+    if (hit) {
+      return hit;
+    }
+    // Ожидание без таймера: цикл держит поток, пока отсоединённый процесс пишет.
+    spawnSync(process.execPath, ["-e", "setTimeout(() => {}, 250)"]);
+  }
+  return null;
+}
+
+test("--background: ссылка снимается в родителе, отсоединённый прогон идёт на НАЗВАННУЮ сессию", () => {
+  // Форма, на которой дефект и воспроизводился в живой работе: текст в stdin,
+  // прогон отсоединяется, а сессию родитель передаёт потомку через окружение.
+  const { home, workspace } = freshCase();
+  const log = path.join(workspace, "pi-calls.jsonl");
+
+  const { result } = cli({
+    home,
+    workspace,
+    args: ["continue", SESSION_A, "--stdin", "--background"],
+    input: "продолжи фикс-раунд"
+  });
+  assert.equal(result.status, 0, `отсоединение прошло:\n${result.stderr}`);
+
+  const call = awaitCall(log, (row) => row.prompt.includes("продолжи фикс-раунд"));
+  assert.ok(call, "отсоединённый прогон дошёл до запуска двойника");
+  assert.equal(argOf(call.args, "--session"), SESSION_A, "фоновый прогон ушёл на названную сессию, а не на последнюю");
+  assert.equal(argOf(call.args, "--model"), "deepseek-chat", "оборудование — от названной сессии");
+  assert.ok(!call.prompt.includes(SESSION_A), "id сессии не протёк в текст промпта");
+});
+
 test.after(() => {
   fs.rmSync(FAKE_ROOT, { recursive: true, force: true });
 });
