@@ -229,32 +229,109 @@ test("a preset mount whose host path does not exist is still a gap (missing-host
   }
 });
 
-test("the capability report and the run path judge the same sandbox", () => {
-  // The divergence this file exists to prevent: `presets` counted gaps against
-  // the bare profile while the run attached the preset's mounts first, and the
-  // two answers disagreed. Both sides must go through sandboxForRun; if either
-  // stops doing that, this goes red on a preset that mounts its own skills.
-  const hostDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-skills-"));
+test("one preset with an unparseable mount degrades itself, not the listing", () => {
+  // The reason the whole channel matters: `presets --json` answers every
+  // rejected delegation, so a single mount typo killing the listing silences
+  // every hook at once. The broken preset carries the parse error; the healthy
+  // one next to it is still described in full.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-home-"));
   try {
     const config = configWith({
-      dev: {
-        sandbox: { profile: "bare" },
-        skills: ["/pi-skills/git-commit", "/pi-skills/testing-principles"],
-        mounts: [`${hostDir}/git-commit:/pi-skills/git-commit:ro`]
-      }
+      good: { sandbox: { profile: "base" } },
+      typo: { sandbox: { profile: "base" }, mounts: ["/pi-skills/git-commit"] }
     });
-    const settings = resolveRunSettings(config, "delegate", { preset: "dev" });
-    const sandbox = sandboxForRun(settings, config);
-    const runGaps = sandboxMountGaps(sandbox, {
-      workspaceRoot: process.cwd(),
-      extensions: [...sandbox.extensions, ...settings.extensions],
-      skills: settings.noSkills ? [] : [...sandbox.skills, ...settings.skills]
-    });
-    assert.deepEqual(
-      presetCapabilities(config, "dev").mountGaps,
-      runGaps.map((gap) => gap.value)
+    const caps = allPresetCapabilities(config, { homeDir: home });
+    assert.equal(caps.good.vision, "skill", "the healthy preset keeps its capabilities");
+    assert.equal(caps.good.unresolved, undefined);
+    assert.equal(caps.typo.vision, null);
+    assert.equal(caps.typo.shell, false);
+    assert.deepEqual(caps.typo.skills, []);
+    assert.match(caps.typo.unresolved, /Invalid mount/);
+
+    const lines = presetLines(config.presets, caps);
+    assert.match(lines[0], /vision `skill`/);
+    assert.doesNotMatch(lines[0], /NOT PARSED/);
+    assert.match(lines[1], /NOT PARSED.*Invalid mount/);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("the capability report and the run path judge the same sandbox", async () => {
+  // The divergence this file exists to prevent: `presets` counted gaps against
+  // the bare profile while the run attached the preset's mounts first, and the
+  // two answers disagreed. The run side goes through the real buildRunSettings
+  // (worktree, read-only guard and all), not a hand-copied assembly — a copy
+  // can agree with the report while the actual run path answers differently.
+  // A host source is created so the two sides CAN diverge: with the source
+  // missing, both sides used to return the same values and only `reason` told
+  // them apart, which this test used to throw away.
+  const { buildRunSettings } = await import("../plugins/pi/scripts/pi-companion.mjs");
+  const { execFileSync } = await import("node:child_process");
+
+  const hostDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-skills-"));
+  fs.mkdirSync(path.join(hostDir, "git-commit"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-worktree-"));
+  const main = path.join(root, "main");
+  const tree = path.join(root, "tree");
+  const run = (args, cwd) =>
+    execFileSync("git", args, { cwd, env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" } });
+  try {
+    run(["init", "-q", main], root);
+    run(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "--no-gpg-sign", "-m", "init"], main);
+    run(["worktree", "add", "-q", tree, "-b", "side"], main);
+    const gitDir = path.join(main, ".git");
+
+    // The second mount names a target the worktree's read-only guard also
+    // claims: the report must not count it as carried equipment, and the run
+    // must say out loud that the guard took the path away.
+    const config = configWith(
+      {
+        dev: {
+          sandbox: { profile: "bare" },
+          skills: ["/pi-skills/git-commit"],
+          mounts: [
+            `${hostDir}/git-commit:/pi-skills/git-commit:ro`,
+            `${gitDir}/hooks:${gitDir}/hooks`
+          ]
+        }
+      },
+      { bare: { image: "busybox" } }
     );
+
+    const reportGaps = presetCapabilities(config, "dev", { homeDir: root }).mountGaps;
+    const settings = buildRunSettings({
+      command: "delegate",
+      flags: { preset: "dev" },
+      workspaceRoot: tree,
+      runRoot: tree,
+      config
+    });
+    const runGaps = sandboxMountGaps(settings.sandbox, {
+      workspaceRoot: tree,
+      extensions: settings.extensions,
+      skills: settings.skills
+    });
+    // Full gap objects, reason included: value-only comparison cannot tell
+    // "unmounted" from "mounted from a path that does not exist".
+    assert.deepEqual(reportGaps, runGaps);
+    assert.deepEqual(reportGaps, [], "an existing host source leaves no gap on either side");
+
+    // The guard won the shared target, and the loss was announced.
+    assert.ok(
+      settings.sandbox.mounts.includes(`${gitDir}/hooks:${gitDir}/hooks:ro`),
+      "the read-only guard keeps the container path"
+    );
+    assert.ok(
+      settings.warnings.some(
+        (warning) => warning.includes(`${gitDir}/hooks:${gitDir}/hooks`) && warning.includes("overridden")
+      ),
+      "the overridden mount is named in the run warnings"
+    );
+    // A mount whose target the guard does not claim still travels.
+    assert.ok(settings.sandbox.mounts.includes(`${hostDir}/git-commit:/pi-skills/git-commit:ro`));
   } finally {
     fs.rmSync(hostDir, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });

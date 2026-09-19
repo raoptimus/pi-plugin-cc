@@ -125,6 +125,10 @@ export function presetLines(presets, capabilities = {}, limits = {}) {
       caps.tags?.length ? `tags \`${caps.tags.join(", ")}\`` : null,
       // Loudest field on the line: the preset names equipment the container will
       // not have, so a run would work without the rules that equipment carries.
+      // A preset whose sandbox descriptor cannot be parsed is described as
+      // unresolvable rather than silently blank: its capabilities are unknown,
+      // and a blank line reads as "no overrides", which is a different answer.
+      caps.unresolved ? `⚠ NOT PARSED: ${caps.unresolved}` : null,
       caps.mountGaps?.length ? `⚠ NOT MOUNTED: ${caps.mountGaps.join(", ")}` : null
     ]
       .filter(Boolean)

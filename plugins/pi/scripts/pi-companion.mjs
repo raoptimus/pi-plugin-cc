@@ -624,12 +624,22 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
     // in hand; the proxy itself starts per run, next to the credential one.
     sandbox = { ...sandbox, gitProxyHosts: resolveGitProxyHosts(config, sandbox) };
     // A worktree cannot see its own repository through /workspace alone, so the
-    // shared .git is mounted for it. Listed before the run's own mounts, which
-    // therefore win the deduplication if one names the same target explicitly.
+    // shared .git is mounted for it. Attached after the run's own mounts, so on
+    // a shared container path the read-only guard wins — isolation over
+    // convenience, and deliberately in that direction. What this owes the user
+    // instead is a named warning: a mount written by hand and dropped without a
+    // word is a silent misconfiguration, not a decision.
     const worktreeMounts = resolveWorktreeMount(runRoot) ?? [];
     worktreeMount = worktreeMounts[0] ?? null;
-    // The preset's own mounts are already on the sandbox (sandboxForRun); the
-    // worktree mount is run-specific, so it goes on top here.
+    const guardTargets = new Set(worktreeMounts.map((mount) => String(mount).split(":")[1]));
+    for (const mount of settings.mounts) {
+      const target = String(mount).split(":")[1];
+      if (target && guardTargets.has(target)) {
+        warnings.push(
+          `Mount \`${mount}\` is overridden by the read-only guard on the shared .git of this worktree; that container path is not yours to replace.`
+        );
+      }
+    }
     sandbox = attachMounts(sandbox, worktreeMounts);
     const identity = gitIdentityEnv(settings.git);
     if (Object.keys(identity).length) {
