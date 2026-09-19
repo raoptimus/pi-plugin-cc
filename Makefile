@@ -22,7 +22,7 @@ CLAUDE      ?= claude
 BIN_DIR     ?= $(HOME)/.local/bin
 PI          ?= $(BIN_DIR)/pia
 PI_SANDBOX  ?= $(HOME)/.claude/pi/sandbox
-SHIPPED_DF  := $(ROOT)/plugins/$(PLUGIN)/sandbox/Dockerfile
+SANDBOX_DIR := $(ROOT)/plugins/$(PLUGIN)/sandbox
 
 .DEFAULT_GOAL := help
 .PHONY: help install update check-marketplace update-cc update-pi uninstall reinstall validate test status link
@@ -80,9 +80,10 @@ update-cc: check-marketplace ## Claude Code only: refresh the marketplace and re
 # elsewhere is the sandbox image, and it is built from the Dockerfiles in the
 # user's own pi directory — not from the one this repo ships. So this half
 # checks rather than copies, and it checks the two things that go wrong quietly:
-# the shim in PATH pointing at a different checkout, and an image older than the
-# Dockerfile it was built from. Neither shows up in the CLI output; both mean the
-# agent runs code nobody edited. The shim is fatal — it makes the whole update a
+# the shim in PATH pointing at a different checkout, a live sandbox file that has
+# drifted from the one this repo ships, and an image holding an older pi than the
+# host. None of the three shows up in the CLI output; each means the agent runs
+# something nobody chose. The shim is fatal — it makes the whole update a
 # no-op for the CLI. The Dockerfile drift stays a warning: the live file is the
 # owner's to diverge, and a rebuild is not part of an update anyway.
 #
@@ -99,11 +100,36 @@ update-pi: ## pi only: check that the pi side runs THIS checkout, not another on
 			   exit 1 ;; \
 		esac; \
 	fi
-	@if [ -f "$(PI_SANDBOX)/base.Dockerfile" ] && ! diff -q "$(SHIPPED_DF)" "$(PI_SANDBOX)/base.Dockerfile" >/dev/null 2>&1; then \
-		echo "pi-sync: WARN — the live base Dockerfile has drifted from the one this repo ships"; \
-		echo "  shipped: $(SHIPPED_DF)"; \
-		echo "  live:    $(PI_SANDBOX)/base.Dockerfile"; \
-		echo "  diff them before assuming the sandbox matches this checkout"; \
+	@drift=0; \
+	for shipped in $(SANDBOX_DIR)/*; do \
+		[ -f "$$shipped" ] || continue; \
+		name=$$(basename "$$shipped"); \
+		live="$(PI_SANDBOX)/$$name"; \
+		[ "$$name" = "Dockerfile" ] && live="$(PI_SANDBOX)/base.Dockerfile"; \
+		[ -f "$$live" ] || continue; \
+		diff -q "$$shipped" "$$live" >/dev/null 2>&1 && continue; \
+		if [ $$drift -eq 0 ]; then \
+			echo "pi-sync: WARN — live sandbox files have drifted from the ones this repo ships"; \
+			drift=1; \
+		fi; \
+		echo "  $$name"; \
+		echo "    shipped: $$shipped"; \
+		echo "    live:    $$live"; \
+	done; \
+	[ $$drift -eq 1 ] && echo "  diff them before assuming the sandbox matches this checkout"; \
+	true
+	@if [ -x "$(PI)" ] && command -v docker >/dev/null 2>&1; then \
+		host=$$(command -v pi >/dev/null 2>&1 && pi --version 2>/dev/null | tr -dc '0-9.'); \
+		for img in $$($(PI) sandbox status 2>/dev/null | awk -F'`' '/^- `/{print $$2}'); do \
+			baked=$$(docker run --rm --entrypoint pi "$$img" --version 2>/dev/null | tr -dc '0-9.'); \
+			[ -n "$$baked" ] || continue; \
+			if [ -z "$$host" ] || [ "$$baked" = "$$host" ]; then \
+				echo "pi-sync: $$img runs pi $$baked"; \
+			else \
+				echo "pi-sync: WARN — $$img runs pi $$baked, the host runs $$host"; \
+				echo "  an image keeps the version it was built with: PI_REBUILD=1 make update-pi"; \
+			fi; \
+		done; \
 	fi
 	@if [ -x "$(PI)" ]; then \
 		if [ "$(PI_REBUILD)" = "1" ]; then \
