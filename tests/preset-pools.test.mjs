@@ -150,10 +150,14 @@ test("a busy pool is skipped after the wait threshold, and only an all-busy role
   const progress = [];
   const onProgress = (event) => progress.push(event.message ?? "");
 
-  // Threshold 0: a busy pool is left immediately for a free one.
+  // Threshold 0: a busy pool is left immediately for a free one. Timed,
+  // because "eventually picks the free one" is also what ignoring the
+  // threshold looks like — the difference is whether we queued first.
   const held = await awaitSandboxSlot(first.sandbox, { timeoutMs: 1000, pollMs: 10 });
   try {
+    const startedAt = Date.now();
     const picked = await awaitVariantSlot(variants, { poolWaitMs: 0, timeoutMs: 5000, onProgress });
+    assert.ok(Date.now() - startedAt < 2000, "the busy pool is not queued past the zero threshold");
     assert.equal(picked.poolName, second.poolName, "the free variant is taken instead of queuing");
     picked.release();
   } finally {
