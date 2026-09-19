@@ -1203,8 +1203,12 @@ async function commandContinue(argv, workspaceRoot) {
   const { flags, positional } = parseArgs(argv, RUN_FLAGS);
   const words = [...positional];
   // `continue last "…"`: a positional is taken as the reference only when it
-  // cannot be mistaken for the first word of the task.
-  const reference = flags.session ?? (words.length > 1 && isSessionReference(words[0]) ? words.shift() : null);
+  // cannot be mistaken for the first word of the task. With the task text
+  // arriving outside the positional list (`--stdin`, a detached handoff) that
+  // guard no longer applies — the lone positional is unambiguous, and letting
+  // it through glued the session id into the prompt while the run silently
+  // went to the newest session of the workspace.
+  const reference = flags.session ?? (words.length > 0 && isSessionReference(words[0]) ? words.shift() : null);
 
   const handedOver = takeDetachedPrompt();
   const piped = !handedOver && flags.stdin ? readStdin().trim() : "";
@@ -1248,17 +1252,23 @@ async function commandContinue(argv, workspaceRoot) {
   });
 
   // The recipe of the run that owns the session is the floor; flags override it
-  // the way they do on `rerun`.
+  // the way they do on `rerun`. An explicit --preset that names a different
+  // agent cancels the recipe's model/provider/thinking/engine/sandbox: those
+  // come from the new preset, or the run would pair the new preset's prompt
+  // and tools with the old run's model — the mismatch the caller was trying
+  // to leave.
   const recipe = session.recipe ?? {};
+  const presetSwitched = Boolean(flags.preset && recipe.preset && flags.preset !== recipe.preset);
+  const fromRecipe = presetSwitched ? {} : recipe;
   const runRoot = resolveRunRoot(flags.cwd ?? session.runRoot ?? null);
   const merged = {
     ...flags,
     preset: flags.preset ?? recipe.preset,
-    model: flags.model ?? recipe.model,
-    provider: flags.provider ?? recipe.provider,
-    thinking: flags.thinking ?? recipe.thinking,
-    engine: flags.engine ?? recipe.engine,
-    sandbox: flags.sandbox ?? recipe.sandbox,
+    model: flags.model ?? fromRecipe.model,
+    provider: flags.provider ?? fromRecipe.provider,
+    thinking: flags.thinking ?? fromRecipe.thinking,
+    engine: flags.engine ?? fromRecipe.engine,
+    sandbox: flags.sandbox ?? fromRecipe.sandbox,
     ...(recipe.readOnly && !flags.write ? { "read-only": true } : {}),
     timeout: flags.timeout ?? (recipe.timeoutMs ? String(Math.round(recipe.timeoutMs / 1000)) : undefined)
   };
@@ -1437,11 +1447,29 @@ async function commandDelegate(argv, workspaceRoot) {
   // Anything the project layer was not allowed to set has to be visible: a
   // silently ignored setting looks exactly like one that did not work.
   settings.warnings = [...(configWarnings ?? []), ...settings.warnings];
-  const sessionId = flags.fresh ? null : resolveSessionReference(workspaceRoot, flags.session);
+  let sessionId = flags.fresh ? null : resolveSessionReference(workspaceRoot, flags.session);
   // A session named here is continued as-is: `delegate` keeps the flags it was
   // given and inherits nothing from the run that owns the session. The age of
   // the cache is still checked — it costs the same money either way.
   const continued = sessionId ? findSession(workspaceSessions(workspaceRoot), sessionId) : null;
+  if (continued) {
+    // `findSession` also matches job ids: passing a job of this workspace
+    // continues the pi session that job owns, not a session id pi has never
+    // heard of. An unmatched reference is refused here rather than relayed to
+    // pi, whose "No session found" names none of the sessions that do exist.
+    sessionId = continued.sessionId;
+  } else if (sessionId && flags.session && flags.session !== "last" && flags.session !== "latest") {
+    const known = workspaceSessions(workspaceRoot);
+    throw new Error(
+      known.length
+        ? `No session here matches "${sessionId}". Sessions recorded for this workspace: ${known
+            .slice(0, 5)
+            .map((entry) => entry.sessionId.slice(0, 8))
+            .join(", ")}. Full list: \`sessions\`.`
+        : "No pi session recorded for this workspace. Job state is bucketed by the directory a run was started from, " +
+            "so a session started elsewhere is not lost — run `sessions --global` to find its workspace."
+    );
+  }
   if (continued) {
     settings.continuation = guardSessionAge(continued, { config, flags, command: "delegate" });
     if (continued.preset && !flags.preset) {
