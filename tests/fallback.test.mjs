@@ -185,7 +185,9 @@ function makeHome() {
     JSON.stringify({
       presets: {
         "go-developer-deepseek": { model: "deepseek-chat", provider: "deepseek", engine: "json", fallbackPreset: "go-developer-zai" },
-        "go-developer-zai": { model: "glm-5", provider: "zai", engine: "json" }
+        "go-developer-zai": { model: "glm-5", provider: "zai", engine: "json" },
+        "dead-broken": { model: "x", fallbackPreset: "broken" },
+        broken: { sandbox: "no-such-profile" }
       }
     })
   );
@@ -204,6 +206,11 @@ process.stdin.on("data", (chunk) => { prompt += chunk; });
 process.stdin.on("end", () => {
   const say = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
   fs.appendFileSync(process.env.PI_FAKE_LOG, JSON.stringify({ args: process.argv.slice(2), prompt }) + "\\n");
+  if (process.env.PI_FAKE_PROVIDER_FAIL) {
+    // Умирает как провайдер, а не как ошибка запуска: отказ в stderr, ненулевой код.
+    process.stderr.write(process.env.PI_FAKE_PROVIDER_FAIL + "\\n");
+    process.exit(1);
+  }
   say({ type: "session", id: "sess-fb" });
   say({ type: "turn_start" });
   say({ type: "message_end", message: { role: "assistant", stopReason: "stop", usage: { input: 1, output: 1 }, content: [{ type: "text", text: "done" }] } });
@@ -211,6 +218,21 @@ process.stdin.on("end", () => {
 `,
   { encoding: "utf8", mode: 0o755 }
 );
+
+test("цитата отказа в ответе агента при пустом канале отказа пресет не убивает", () => {
+  const runs = [
+    {
+      preset: "go-developer-zai",
+      status: "failed",
+      // Канал отказа пуст: прогон упал по бюджету, а слова о сети — цитата из
+      // работы агента, осевшая в result_text.
+      error_text: null,
+      result_text: "Логи падают с fetch failed: ECONNREFUSED 10.0.0.5:443, чиню ретраи.",
+      created_at: new Date().toISOString()
+    }
+  ];
+  assert.equal(presetDead("go-developer-zai", runs), null);
+});
 
 function seedFailure(dbFile, preset, text) {
   const handle = openDatabase(dbFile);
@@ -224,7 +246,7 @@ function seedFailure(dbFile, preset, text) {
   }
 }
 
-function runDelegate({ home, workspace, dbFile, preset, extra = [] }) {
+function runDelegate({ home, workspace, dbFile, preset, extra = [], extraEnv = {} }) {
   const log = path.join(workspace, "pi-calls.jsonl");
   fs.writeFileSync(log, "", "utf8");
   const result = spawnSync(
@@ -240,7 +262,8 @@ function runDelegate({ home, workspace, dbFile, preset, extra = [] }) {
         XDG_DATA_HOME: path.join(workspace, "data"),
         PI_PLUGIN_BINARY: FAKE_BINARY,
         PI_PLUGIN_DB: dbFile,
-        PI_FAKE_LOG: log
+        PI_FAKE_LOG: log,
+        ...extraEnv
       }
     }
   );
@@ -326,6 +349,56 @@ test("--no-fallback на живом пресете не меняет повед�
   const args = calls().at(-1).args;
   assert.equal(args[args.indexOf("--provider") + 1], "deepseek");
   assert.doesNotMatch(result.stdout, /--no-fallback/, "о подмене, которой не было, строк нет");
+});
+
+test("отказ провайдера из реального прогона доезжает до журнала и уводит следующую выдачу", () => {
+  const home = makeHome();
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fallback-ws-"));
+  const dbFile = path.join(workspace, "jobs.db");
+
+  // Прогон 1: pi отрабатывает, провайдер отвечает отказом — как настоящий 402.
+  const first = runDelegate({
+    home,
+    workspace,
+    dbFile,
+    preset: "go-developer-deepseek",
+    extraEnv: { PI_FAKE_PROVIDER_FAIL: "Error 402: Insufficient Balance" }
+  });
+  assert.notEqual(first.result.status, 0, "умерший провайдер — проваленный прогон");
+
+  // Причина отказа лежит в канале ошибки журнала: подмена читает его, а не ответ агента.
+  let handle = openDatabase(dbFile);
+  let rows = queryPresetHealth(handle);
+  handle.close();
+  const failedRow = rows.find((row) => row.preset === "go-developer-deepseek");
+  assert.equal(failedRow.status, "failed");
+  assert.match(failedRow.error_text, /402/, "причина отказа провайдера попала в error_text");
+
+  // Прогон 2: тот же пресет уходит на живого кандидата.
+  const second = runDelegate({ home, workspace, dbFile, preset: "go-developer-deepseek" });
+  assert.equal(second.result.status, 0, `CLI завершился успешно:\n${second.result.stderr}`);
+  const args = second.calls().at(-1).args;
+  assert.equal(args[args.indexOf("--provider") + 1], "zai", "прогон уехал на запасного провайдера");
+
+  // Запрошенный и фактический пресеты — оба в журнале.
+  handle = openDatabase(dbFile);
+  rows = handle.db.prepare("SELECT preset, requested_preset, status FROM jobs ORDER BY created_at DESC").all();
+  handle.close();
+  assert.equal(rows[0].preset, "go-developer-zai", "фактический пресет — кандидат");
+  assert.equal(rows[0].requested_preset, "go-developer-deepseek", "запрошенный сохранён рядом");
+});
+
+test("битый кандидат не роняет delegate: прогон остаётся у запрошенного пресета", () => {
+  const home = makeHome();
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fallback-ws-"));
+  const dbFile = path.join(workspace, "jobs.db");
+  seedFailure(dbFile, "dead-broken", "Error 402: Insufficient Balance");
+
+  const { result, calls } = runDelegate({ home, workspace, dbFile, preset: "dead-broken" });
+  assert.equal(result.status, 0, `кандидат с битым профилем не должен ронять запуск:\n${result.stderr}`);
+  const args = calls().at(-1).args;
+  assert.ok(!args.includes("--provider"), "подмены на битого кандидата не произошло");
+  assert.match(result.stdout, /no-such-profile|could not be resolved/i, "причина отказа от подмены названа");
 });
 
 test.after(() => {

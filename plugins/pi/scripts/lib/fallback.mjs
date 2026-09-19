@@ -125,7 +125,12 @@ export function deriveFallbackChain(presetName, config) {
  * the preset alive — an unidentified refusal is the caller's to judge, not a
  * reason to silently move the work elsewhere.
  *
- * @param {Array<{preset: ?string, status: ?string, error_text: ?string, result_text: ?string}>} runs
+ * Only `error_text` is read, never `result_text`: the result column holds the
+ * agent's last answer, and an assistant that quotes a log line — "fetch failed:
+ * ECONNREFUSED" — while working would otherwise be taken for a dead provider,
+ * silently moving the whole fleet off a healthy preset.
+ *
+ * @param {Array<{preset: ?string, status: ?string, error_text: ?string}>} runs
  *        journal rows, newest first
  */
 export function presetDead(presetName, runs) {
@@ -133,8 +138,8 @@ export function presetDead(presetName, runs) {
   if (!last || last.status !== "failed") {
     return null;
   }
-  const kind = classifyFailure(last.error_text || last.result_text);
-  return kind === "quota" || kind === "network" ? { kind, text: String(last.error_text || last.result_text) } : null;
+  const kind = classifyFailure(last.error_text);
+  return kind === "quota" || kind === "network" ? { kind, text: String(last.error_text) } : null;
 }
 
 /**

@@ -799,6 +799,7 @@ function detachBackgroundRun({ kind, workspaceRoot, jobId, title, prompt, settin
     runRoot: settings.runRoot ?? workspaceRoot,
     model: settings.model,
     preset: settings.presetName,
+    requestedPreset: settings.requestedPresetName ?? settings.presetName,
     sandbox: settings.sandboxLabel,
     background: true,
     detached: true,
@@ -825,6 +826,7 @@ function detachBackgroundRun({ kind, workspaceRoot, jobId, title, prompt, settin
 function rerunRecipe(settings) {
   const recipe = {
     preset: settings.presetName ?? null,
+    requestedPreset: settings.requestedPresetName ?? settings.presetName ?? null,
     model: settings.model ?? null,
     provider: settings.provider ?? null,
     thinking: settings.thinking ?? null,
@@ -869,6 +871,7 @@ async function executeRun({
     model: settings.model,
     systemPromptName: settings.promptName,
     preset: settings.presetName,
+    requestedPreset: settings.requestedPresetName ?? settings.presetName,
     readOnly: settings.readOnly,
     sandbox: settings.sandboxLabel,
     background: Boolean(flags.background),
@@ -1367,17 +1370,32 @@ async function applyFallbackPreset({ command, flags, workspaceRoot, runRoot, con
     );
     return settings;
   }
-  const swapped = buildRunSettings({
-    command,
-    flags: { ...flags, preset: swap.preset },
-    workspaceRoot,
-    runRoot,
-    config,
-    trusted
-  });
+  let swapped;
+  try {
+    swapped = buildRunSettings({
+      command,
+      flags: { ...flags, preset: swap.preset },
+      workspaceRoot,
+      runRoot,
+      config,
+      trusted
+    });
+  } catch (error) {
+    // A candidate that does not resolve (unknown sandbox profile, failing
+    // preflight) is not a reason to lose the run before it starts: the caller
+    // asked for work, not for a crash. Treat the candidate as absent — the run
+    // goes to the preset that was asked for, and its own failure is the
+    // journalable outcome the fallback chain exists to react to.
+    settings.warnings.push(
+      `Fallback candidate \`${swap.preset}\` could not be resolved (${String(error.message ?? error).slice(0, 120)}) — ` +
+        `running on \`${settings.presetName}\` as asked.`
+    );
+    return settings;
+  }
   // The swap must be visible, not just happen: the caller chose a preset and
   // got another one, and the reason quotes the refusal so the report explains
   // the switch without a second lookup.
+  swapped.requestedPresetName = settings.presetName;
   swapped.warnings.push(
     `Preset \`${settings.presetName}\` last failed on ${swap.dead.kind} ("${swap.dead.text.slice(0, 120)}") — ` +
       `running on \`${swap.preset}\` instead.`

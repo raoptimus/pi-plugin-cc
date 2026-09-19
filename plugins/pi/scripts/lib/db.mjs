@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   workspace        TEXT,
   run_root         TEXT,
   preset           TEXT,
+  requested_preset TEXT,
   model            TEXT,
   sandbox          TEXT,
   status           TEXT,
@@ -233,6 +234,10 @@ function addMissingColumns(db) {
     ["result_text", "TEXT"],
     ["error_text", "TEXT"],
     ["settings", "TEXT"],
+    // The preset the caller asked for, alongside `preset` — what actually ran.
+    // After a fallback swap these differ, and a supervisor reading only the
+    // swap's column would credit the work to a preset nobody ordered.
+    ["requested_preset", "TEXT"],
     // Rolled up from `requests` when the run ends, so the reports keep reading
     // one table instead of joining per row.
     ["req_count", "INTEGER DEFAULT 0"],
@@ -352,6 +357,7 @@ const COLUMNS = [
   "workspace",
   "run_root",
   "preset",
+  "requested_preset",
   "model",
   "sandbox",
   "status",
@@ -444,6 +450,7 @@ export function jobToRow(job) {
     workspace: job.workspaceRoot ?? null,
     run_root: job.runRoot ?? job.workspaceRoot ?? null,
     preset: job.preset ?? null,
+    requested_preset: job.requestedPreset ?? null,
     model: job.model ?? null,
     sandbox: job.sandbox ?? null,
     status: job.status ?? null,
@@ -492,12 +499,13 @@ export function jobToRow(job) {
     // outlives the run, the temp directory and the reboot.
     prompt: forJournal(job.prompt ?? null, MAX_TEXT_CHARS),
     result_text: forJournal(job.text ?? null, MAX_TEXT_CHARS),
-    // Thrown failures carry their reason only in `errorMessage`, which the job
-    // file keeps but the journal would otherwise not: the fallback-preset
+    // Thrown failures carry their reason only in `errorMessage`; a run pi
+    // itself finished with a non-zero exit keeps it in `errors` (the provider's
+    // stderr lands there — a 402, a refused connection). The fallback-preset
     // dispatch reads this column to tell a dead provider from any other
-    // failure. Capped tightly — an error message is a quote of the provider,
-    // not content worth archiving.
-    error_text: forJournal(job.errorMessage ?? null, MAX_ERROR_CHARS),
+    // failure, so both routes have to reach it. Capped tightly — an error
+    // message is a quote of the provider, not content worth archiving.
+    error_text: forJournal(job.errorMessage ?? job.errors?.[0] ?? null, MAX_ERROR_CHARS),
     settings: job.rerunSettings ? forJournal(JSON.stringify(job.rerunSettings), MAX_TEXT_CHARS) : null,
     req_count: job.proxyStats?.count ?? 0,
     req_failed: job.proxyStats?.failed ?? 0,
