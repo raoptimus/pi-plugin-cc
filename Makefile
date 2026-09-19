@@ -25,7 +25,7 @@ PI_SANDBOX  ?= $(HOME)/.claude/pi/sandbox
 SHIPPED_DF  := $(ROOT)/plugins/$(PLUGIN)/sandbox/Dockerfile
 
 .DEFAULT_GOAL := help
-.PHONY: help install update update-cc update-pi uninstall reinstall validate test status link
+.PHONY: help install update check-marketplace update-cc update-pi uninstall reinstall validate test status link
 
 help: ## List the targets
 	@awk 'BEGIN{FS=":.*##"} /^[a-z-]+:.*##/ {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -47,7 +47,28 @@ install: validate ## Register this directory as a marketplace and install the pl
 # Close the other sessions — this one included — if it does.
 update: validate update-cc update-pi ## Copy the current checkout into BOTH harnesses
 
-update-cc: ## Claude Code only: refresh the marketplace and reinstall the plugin
+# The name `pi-tools` is shared with the GitHub marketplace this repo publishes
+# to, and `marketplace add` does not displace a registration that already holds
+# the name. Leave the GitHub one registered and every `make update` refreshes a
+# git clone instead of this directory: the reinstall runs, reports success, and
+# installs origin/main. Nothing in the output says so — the only visible symptom
+# is an edit that never takes effect. Hence a check before anything is touched,
+# and a non-zero exit rather than a warning: a silent failure is what this cost.
+check-marketplace: ## Fail unless `$(MARKETPLACE)` is registered as THIS directory
+	@src=$$($(CLAUDE) plugin marketplace list 2>/dev/null | awk -v m="$(MARKETPLACE)" '$$NF==m{getline; print; exit}'); \
+	case "$$src" in \
+		*"Directory ($(ROOT))"*) echo "mp-check: $(MARKETPLACE) -> $(ROOT) (this checkout)" ;; \
+		"") echo "mp-check: FATAL — marketplace $(MARKETPLACE) is not registered"; \
+		    echo "  register this checkout with: make install"; \
+		    exit 1 ;; \
+		*) echo "mp-check: FATAL — $(MARKETPLACE) is registered elsewhere:"; \
+		   echo "  $$src"; \
+		   echo "  a reinstall would install THAT source, not this checkout"; \
+		   echo "  fix: claude plugin marketplace remove $(MARKETPLACE) && make install"; \
+		   exit 1 ;; \
+	esac
+
+update-cc: check-marketplace ## Claude Code only: refresh the marketplace and reinstall the plugin
 	$(CLAUDE) plugin marketplace update $(MARKETPLACE)
 	$(CLAUDE) plugin uninstall $(PLUGIN)@$(MARKETPLACE) -y
 	$(CLAUDE) plugin install $(PLUGIN)@$(MARKETPLACE) -y
@@ -61,7 +82,9 @@ update-cc: ## Claude Code only: refresh the marketplace and reinstall the plugin
 # checks rather than copies, and it checks the two things that go wrong quietly:
 # the shim in PATH pointing at a different checkout, and an image older than the
 # Dockerfile it was built from. Neither shows up in the CLI output; both mean the
-# agent runs code nobody edited.
+# agent runs code nobody edited. The shim is fatal — it makes the whole update a
+# no-op for the CLI. The Dockerfile drift stays a warning: the live file is the
+# owner's to diverge, and a rebuild is not part of an update anyway.
 #
 # A rebuild is minutes and gigabytes, so it is opt-in: PI_REBUILD=1 make update.
 update-pi: ## pi only: check that the pi side runs THIS checkout, not another one
@@ -71,8 +94,9 @@ update-pi: ## pi only: check that the pi side runs THIS checkout, not another on
 		target=$$(readlink "$(PI)" || echo "$(PI)"); \
 		case "$$target" in \
 			"$(ROOT)"/*) echo "pi-sync: pia -> $$target (this checkout)" ;; \
-			*) echo "pi-sync: WARN — pia points outside this checkout: $$target"; \
-			   echo "  edits here will not reach the CLI; 'make link' repoints it" ;; \
+			*) echo "pi-sync: FATAL — pia points outside this checkout: $$target"; \
+			   echo "  edits here will not reach the CLI; 'make link' repoints it"; \
+			   exit 1 ;; \
 		esac; \
 	fi
 	@if [ -f "$(PI_SANDBOX)/base.Dockerfile" ] && ! diff -q "$(SHIPPED_DF)" "$(PI_SANDBOX)/base.Dockerfile" >/dev/null 2>&1; then \
