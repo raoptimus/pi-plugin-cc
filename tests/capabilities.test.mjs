@@ -11,6 +11,8 @@ import {
   resolvedSkills
 } from "../plugins/pi/scripts/lib/capabilities.mjs";
 import { presetLines } from "../plugins/pi/scripts/lib/render.mjs";
+import { resolveRunSettings } from "../plugins/pi/scripts/lib/config.mjs";
+import { sandboxForRun, sandboxMountGaps } from "../plugins/pi/scripts/lib/sandbox.mjs";
 
 const PROFILES = {
   base: { image: "img", skills: ["/pi-skills/vision", "/pi-skills/git-commit"] },
@@ -173,6 +175,85 @@ test("a preset whose equipment is mounted reports no gaps", () => {
     assert.deepEqual(presetCapabilities(config, "dev").mountGaps, []);
     const [line] = presetLines(config.presets, allPresetCapabilities(config));
     assert.doesNotMatch(line, /NOT MOUNTED/);
+  } finally {
+    fs.rmSync(hostDir, { recursive: true, force: true });
+  }
+});
+
+test("the preset's own mounts count as carried equipment", () => {
+  // web-developer-zai is the real case: a profile mounting nothing, the preset
+  // carrying its own skill mounts. Judging gaps against the bare profile
+  // reported NOT MOUNTED for a preset the run started just fine.
+  const hostDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-skills-"));
+  fs.mkdirSync(path.join(hostDir, "git-commit"));
+  fs.mkdirSync(path.join(hostDir, "browser"));
+  try {
+    const config = configWith({
+      dev: {
+        sandbox: { profile: "bare" },
+        skills: ["/pi-skills/git-commit", "/pi-skills/browser"],
+        mounts: [`${hostDir}/git-commit:/pi-skills/git-commit:ro`, `${hostDir}/browser:/pi-skills/browser:ro`]
+      }
+    });
+    assert.deepEqual(presetCapabilities(config, "dev").mountGaps, []);
+  } finally {
+    fs.rmSync(hostDir, { recursive: true, force: true });
+  }
+});
+
+test("a skill carried by neither the profile nor the preset's mounts is still a gap", () => {
+  const config = configWith({
+    dev: {
+      sandbox: { profile: "bare" },
+      skills: ["/pi-skills/git-commit"],
+      mounts: ["/tmp/nowhere-else:/some/other/dir"]
+    }
+  });
+  assert.deepEqual(presetCapabilities(config, "dev").mountGaps, ["/pi-skills/git-commit"]);
+});
+
+test("a preset mount whose host path does not exist is still a gap (missing-host-path)", () => {
+  const hostDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-skills-"));
+  const missing = path.join(hostDir, "git-commit");
+  try {
+    const config = configWith({
+      dev: {
+        sandbox: { profile: "bare" },
+        skills: ["/pi-skills/git-commit"],
+        mounts: [`${missing}:/pi-skills/git-commit:ro`]
+      }
+    });
+    assert.deepEqual(presetCapabilities(config, "dev").mountGaps, ["/pi-skills/git-commit"]);
+  } finally {
+    fs.rmSync(hostDir, { recursive: true, force: true });
+  }
+});
+
+test("the capability report and the run path judge the same sandbox", () => {
+  // The divergence this file exists to prevent: `presets` counted gaps against
+  // the bare profile while the run attached the preset's mounts first, and the
+  // two answers disagreed. Both sides must go through sandboxForRun; if either
+  // stops doing that, this goes red on a preset that mounts its own skills.
+  const hostDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-skills-"));
+  try {
+    const config = configWith({
+      dev: {
+        sandbox: { profile: "bare" },
+        skills: ["/pi-skills/git-commit", "/pi-skills/testing-principles"],
+        mounts: [`${hostDir}/git-commit:/pi-skills/git-commit:ro`]
+      }
+    });
+    const settings = resolveRunSettings(config, "delegate", { preset: "dev" });
+    const sandbox = sandboxForRun(settings, config);
+    const runGaps = sandboxMountGaps(sandbox, {
+      workspaceRoot: process.cwd(),
+      extensions: [...sandbox.extensions, ...settings.extensions],
+      skills: settings.noSkills ? [] : [...sandbox.skills, ...settings.skills]
+    });
+    assert.deepEqual(
+      presetCapabilities(config, "dev").mountGaps,
+      runGaps.map((gap) => gap.value)
+    );
   } finally {
     fs.rmSync(hostDir, { recursive: true, force: true });
   }

@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { resolveRunSettings } from "./config.mjs";
-import { isSandboxed, normalizeSandbox, sandboxMountGaps } from "./sandbox.mjs";
+import { isSandboxed, normalizeSandbox, sandboxForRun, sandboxMountGaps } from "./sandbox.mjs";
 
 /**
  * What an agent can do beyond what its model can do.
@@ -75,7 +75,7 @@ export function resolvedSkills(settings, config, { homeDir = os.homedir() } = {}
   if (settings.noSkills) {
     return [];
   }
-  const sandbox = normalizeSandbox(settings.sandbox, config.sandboxProfiles ?? {});
+  const sandbox = sandboxForRun(settings, config);
   const named = [...(settings.skills ?? [])];
   if (isSandboxed(sandbox)) {
     return [...(sandbox.skills ?? []), ...named];
@@ -127,7 +127,7 @@ export function presetCapabilities(config, presetName, { homeDir = os.homedir() 
   // Equipment named by the preset that the container will not have. Listed here
   // so the answer is visible where agents are CHOSEN, not only when one is
   // launched: the run itself refuses, but by then a wave is already half issued.
-  const sandbox = normalizeSandbox(settings.sandbox, config.sandboxProfiles ?? {});
+  const sandbox = sandboxForRun(settings, config);
   const mountGaps = sandboxMountGaps(sandbox, {
     workspaceRoot: process.cwd(),
     extensions: settings.extensions ?? [],

@@ -238,6 +238,22 @@ export function attachMounts(sandbox, extra = []) {
 }
 
 /**
+ * The sandbox a run with these settings would actually get: profile first,
+ * then the preset's own mounts (a later mount on the same container path wins).
+ *
+ * Mount gaps must be judged against this shape, not the bare profile — a preset
+ * carrying its own skill mount is not a gap. Counting the profile alone is how
+ * `presets` printed NOT MOUNTED for every preset that was in fact runnable,
+ * so both the run path and the capability report build the sandbox here.
+ */
+export function sandboxForRun(settings, config) {
+  return attachMounts(
+    normalizeSandbox(settings.sandbox, config.sandboxProfiles ?? {}),
+    settings.mounts ?? []
+  );
+}
+
+/**
  * Container name: the profile it runs, then the job id (already docker-safe).
  *
  * `docker ps` is where you look when something is stuck, and the profile is the

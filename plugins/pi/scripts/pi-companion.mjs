@@ -75,6 +75,7 @@ import {
   removeSandboxContainer,
   listSandboxImages,
   sandboxDockerfile,
+  sandboxForRun,
   sandboxMountGaps,
   sandboxPreflight,
   sandboxRunWarnings,
@@ -601,7 +602,7 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
       `The agent runs in ${runRoot}, outside this workspace. Its edits land there, not in ${workspaceRoot}.`
     );
   }
-  let sandbox = applyConcurrencyPool(normalizeSandbox(settings.sandbox, config.sandboxProfiles), config);
+  let sandbox = applyConcurrencyPool(sandboxForRun(settings, config), config);
   let worktreeMount = null;
   if (settings.mounts.length && !isSandboxed(sandbox)) {
     // Without a container there is nothing to mount into: pi already sees the
@@ -627,7 +628,9 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
     // therefore win the deduplication if one names the same target explicitly.
     const worktreeMounts = resolveWorktreeMount(runRoot) ?? [];
     worktreeMount = worktreeMounts[0] ?? null;
-    sandbox = attachMounts(sandbox, [...worktreeMounts, ...settings.mounts]);
+    // The preset's own mounts are already on the sandbox (sandboxForRun); the
+    // worktree mount is run-specific, so it goes on top here.
+    sandbox = attachMounts(sandbox, worktreeMounts);
     const identity = gitIdentityEnv(settings.git);
     if (Object.keys(identity).length) {
       sandbox = {
