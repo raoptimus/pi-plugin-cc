@@ -47,8 +47,11 @@ function makeHome() {
     path.join(home, ".claude", "pi", "config.json"),
     JSON.stringify({
       presets: {
-        alpha: { model: "deepseek-chat", provider: "deepseek", engine: "json" },
-        beta: { model: "glm-5", provider: "zai", engine: "json" }
+        // Пресеты разведены по КАЖДОМУ полю, которое продолжение наследует от
+        // рецепта: одинаковое значение у обоих делает ассерт декоративным —
+        // «взял у нового пресета» и «унаследовал от сессии» неразличимы.
+        alpha: { model: "deepseek-chat", provider: "deepseek", engine: "json", thinking: "high" },
+        beta: { model: "glm-5", provider: "zai", engine: "json", thinking: "low" }
       }
     })
   );
@@ -178,6 +181,7 @@ test("--preset другого агента отменяет унаследова
   const args = switched.calls().at(-1).args;
   assert.equal(argOf(args, "--model"), "glm-5", "модель — от нового пресета, не от прошлого прогона");
   assert.equal(argOf(args, "--provider"), "zai", "провайдер — от нового пресета");
+  assert.equal(argOf(args, "--thinking"), "low", "уровень размышления — от нового пресета, а не унаследованный high");
 
   const explicit = cli({
     home,
@@ -209,7 +213,69 @@ test("delegate --session <job-id> уходит на сессию джоба; н�
   assert.notEqual(unknown.result.status, 0, "несопоставленная ссылка — отказ");
   const combined = `${unknown.result.stdout}\n${unknown.result.stderr}`;
   assert.match(combined, /никакой-такой-нет/, "в отказе названа ссылка");
-  assert.match(combined, /SESSIONS|sessions/, "перечислено, где посмотреть доступные сессии");
+  // Слово «sessions» стоит в подсказке «run `sessions`» и краснеет даже у
+  // отказа, потерявшего перечень: спрашиваем сами идентификаторы.
+  assert.ok(
+    combined.includes(SESSION_A.slice(0, 8)) || combined.includes(SESSION_B.slice(0, 8)),
+    `в отказе перечислены доступные сессии:\n${combined}`
+  );
+});
+
+test("сессия БЕЗ пресета в рецепте: --preset отменяет модель прошлого прогона", () => {
+  // Класс, который условие `recipe.preset &&` пропускало: родительский прогон
+  // шёл на голых флагах, рецепт ключа preset не содержит вовсе — и смена агента
+  // оставляла ему модель прошлого запуска, хотя пресет применён.
+  const home = makeHome();
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "pi-continue-ws-"));
+  const bare = cli({
+    home,
+    workspace,
+    args: ["delegate", "--model", "custom-x", "--provider", "deepseek", "--engine", "json", "--json", "сделай задачу"],
+    env: { PI_FAKE_SESSION: SESSION_A }
+  });
+  assert.equal(bare.result.status, 0, `delegate без пресета прошёл:\n${bare.result.stderr}`);
+
+  const switched = cli({
+    home,
+    workspace,
+    args: ["continue", SESSION_A, "--preset", "beta", "--stdin"],
+    input: "продолжи фикс-раунд"
+  });
+  assert.equal(switched.result.status, 0, `continue прошёл:\n${switched.result.stderr}`);
+  const args = switched.calls().at(-1).args;
+  assert.equal(argOf(args, "--model"), "glm-5", "модель — от названного пресета, а не custom-x прошлого прогона");
+  assert.equal(argOf(args, "--provider"), "zai", "провайдер — от названного пресета");
+});
+
+test("явный --model старше и нового пресета: --preset beta --model custom-x", () => {
+  const { home, workspace } = freshCase();
+
+  const { result, calls } = cli({
+    home,
+    workspace,
+    args: ["continue", SESSION_A, "--preset", "beta", "--model", "custom-x", "--stdin"],
+    input: "продолжи фикс-раунд"
+  });
+  assert.equal(result.status, 0, `continue прошёл:\n${result.stderr}`);
+  const args = calls().at(-1).args;
+  assert.equal(argOf(args, "--model"), "custom-x", "явный флаг старше и пресета, и рецепта");
+  assert.equal(argOf(args, "--provider"), "zai", "остальное оборудование — от названного пресета");
+});
+
+test("пустой --stdin — такой же отказ, как отсутствие текста вовсе", () => {
+  // Реализация, считающая текстом сам факт флага, запустила бы прогон с пустой
+  // задачей: агент получает пустой промпт и идёт изобретать себе работу.
+  const { home, workspace } = freshCase();
+
+  const { result, newCalls } = cli({
+    home,
+    workspace,
+    args: ["continue", SESSION_A, "--stdin"],
+    input: "   \n  \n"
+  });
+  assert.notEqual(result.status, 0, "пустой канал — не текст задачи");
+  assert.match(`${result.stdout}\n${result.stderr}`, /Usage: continue/, "в отказе названа форма вызова");
+  assert.equal(newCalls().length, 0, "двойник pi не стартовал");
 });
 
 test.after(() => {

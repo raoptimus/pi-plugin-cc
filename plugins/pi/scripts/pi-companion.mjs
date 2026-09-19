@@ -1258,7 +1258,10 @@ async function commandContinue(argv, workspaceRoot) {
   // and tools with the old run's model — the mismatch the caller was trying
   // to leave.
   const recipe = session.recipe ?? {};
-  const presetSwitched = Boolean(flags.preset && recipe.preset && flags.preset !== recipe.preset);
+  // A run that had no preset of its own is still a different agent once one is
+  // named: its model came from bare flags, and inheriting it would pair the new
+  // preset's prompt with the old run's model just as surely.
+  const presetSwitched = Boolean(flags.preset && flags.preset !== (recipe.preset ?? null));
   const fromRecipe = presetSwitched ? {} : recipe;
   const runRoot = resolveRunRoot(flags.cwd ?? session.runRoot ?? null);
   const merged = {
