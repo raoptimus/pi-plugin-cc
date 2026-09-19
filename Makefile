@@ -20,9 +20,12 @@ PLUGIN      := pi
 PLUGIN_DIR  := $(ROOT)/plugins/$(PLUGIN)
 CLAUDE      ?= claude
 BIN_DIR     ?= $(HOME)/.local/bin
+PI          ?= $(BIN_DIR)/pia
+PI_SANDBOX  ?= $(HOME)/.claude/pi/sandbox
+SHIPPED_DF  := $(ROOT)/plugins/$(PLUGIN)/sandbox/Dockerfile
 
 .DEFAULT_GOAL := help
-.PHONY: help install update uninstall reinstall validate test status link
+.PHONY: help install update update-cc update-pi uninstall reinstall validate test status link
 
 help: ## List the targets
 	@awk 'BEGIN{FS=":.*##"} /^[a-z-]+:.*##/ {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -42,12 +45,50 @@ install: validate ## Register this directory as a marketplace and install the pl
 #
 # Uninstall refuses while another Claude Code session holds the installed copy.
 # Close the other sessions — this one included — if it does.
-update: validate ## Copy the current checkout into the installed plugin
+update: validate update-cc update-pi ## Copy the current checkout into BOTH harnesses
+
+update-cc: ## Claude Code only: refresh the marketplace and reinstall the plugin
 	$(CLAUDE) plugin marketplace update $(MARKETPLACE)
 	$(CLAUDE) plugin uninstall $(PLUGIN)@$(MARKETPLACE) -y
 	$(CLAUDE) plugin install $(PLUGIN)@$(MARKETPLACE) -y
 	@$(MAKE) --no-print-directory status
 	@echo "Restart the Claude Code session for the change to take effect."
+
+# The pi half has nothing to install. `pia` is a symlink into this checkout
+# (`make link`), so the CLI is already live; what the pi side actually runs from
+# elsewhere is the sandbox image, and it is built from the Dockerfiles in the
+# user's own pi directory — not from the one this repo ships. So this half
+# checks rather than copies, and it checks the two things that go wrong quietly:
+# the shim in PATH pointing at a different checkout, and an image older than the
+# Dockerfile it was built from. Neither shows up in the CLI output; both mean the
+# agent runs code nobody edited.
+#
+# A rebuild is minutes and gigabytes, so it is opt-in: PI_REBUILD=1 make update.
+update-pi: ## pi only: check that the pi side runs THIS checkout, not another one
+	@if [ ! -x "$(PI)" ]; then \
+		echo "pi-sync: no pia shim at $(PI) — run 'make link' if this machine uses pi"; \
+	else \
+		target=$$(readlink "$(PI)" || echo "$(PI)"); \
+		case "$$target" in \
+			"$(ROOT)"/*) echo "pi-sync: pia -> $$target (this checkout)" ;; \
+			*) echo "pi-sync: WARN — pia points outside this checkout: $$target"; \
+			   echo "  edits here will not reach the CLI; 'make link' repoints it" ;; \
+		esac; \
+	fi
+	@if [ -f "$(PI_SANDBOX)/base.Dockerfile" ] && ! diff -q "$(SHIPPED_DF)" "$(PI_SANDBOX)/base.Dockerfile" >/dev/null 2>&1; then \
+		echo "pi-sync: WARN — the live base Dockerfile has drifted from the one this repo ships"; \
+		echo "  shipped: $(SHIPPED_DF)"; \
+		echo "  live:    $(PI_SANDBOX)/base.Dockerfile"; \
+		echo "  diff them before assuming the sandbox matches this checkout"; \
+	fi
+	@if [ -x "$(PI)" ]; then \
+		if [ "$(PI_REBUILD)" = "1" ]; then \
+			$(PI) sandbox build --all; \
+		else \
+			$(PI) sandbox status 2>/dev/null | awk '/^## Images/{f=1;next} /^## /{f=0} f && NF' | sed 's/^/  /'; \
+			echo "  (rebuild with: PI_REBUILD=1 make update-pi)"; \
+		fi; \
+	fi
 
 uninstall: ## Remove the plugin and unregister the marketplace
 	-$(CLAUDE) plugin uninstall $(PLUGIN)@$(MARKETPLACE) -y
