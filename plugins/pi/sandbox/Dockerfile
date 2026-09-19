@@ -17,7 +17,7 @@ ARG PI_VERSION=latest
 ARG PI_LSP_ADAPTER_VERSION=0.1.3
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends bash ca-certificates curl git less make ripgrep \
+  && apt-get install -y --no-install-recommends bash ca-certificates curl file git less make ripgrep \
   && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSION}"
