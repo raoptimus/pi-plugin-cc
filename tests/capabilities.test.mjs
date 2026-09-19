@@ -257,15 +257,82 @@ test("one preset with an unparseable mount degrades itself, not the listing", ()
   }
 });
 
-test("the capability report and the run path judge the same sandbox", async () => {
+test("the capability report and the run path judge the same sandbox (no docker needed)", () => {
   // The divergence this file exists to prevent: `presets` counted gaps against
   // the bare profile while the run attached the preset's mounts first, and the
-  // two answers disagreed. The run side goes through the real buildRunSettings
-  // (worktree, read-only guard and all), not a hand-copied assembly — a copy
-  // can agree with the report while the actual run path answers differently.
-  // A host source is created so the two sides CAN diverge: with the source
-  // missing, both sides used to return the same values and only `reason` told
-  // them apart, which this test used to throw away.
+  // two answers disagreed. Both sides here go through the shared code paths and
+  // nothing else: the report through `presetCapabilities`, the run through the
+  // same `sandboxForRun` + `sandboxMountGaps` pair `executeRun` judges its gaps
+  // with. A host source is created so the sides CAN agree on empty, and a
+  // second preset names a source that does not exist so `reason` is part of the
+  // comparison — value-only comparison cannot tell "unmounted" from "mounted
+  // from a path that does not exist". No docker: an image-dependent gate is
+  // green on the author's machine and red everywhere else.
+  const hostDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-skills-"));
+  fs.mkdirSync(path.join(hostDir, "git-commit"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-worktree-"));
+  try {
+    const config = configWith(
+      {
+        dev: {
+          sandbox: { profile: "bare" },
+          skills: ["/pi-skills/git-commit"],
+          mounts: [`${hostDir}/git-commit:/pi-skills/git-commit:ro`]
+        },
+        broken: {
+          sandbox: { profile: "bare" },
+          skills: ["/pi-skills/git-commit"],
+          mounts: [`${hostDir}/absent:/pi-skills/git-commit:ro`]
+        }
+      },
+      { bare: { image: "img" } }
+    );
+
+    const runSide = (name) => {
+      const settings = resolveRunSettings(config, "delegate", { preset: name });
+      return sandboxMountGaps(sandboxForRun(settings, config), {
+        workspaceRoot: process.cwd(),
+        extensions: settings.extensions ?? [],
+        skills: settings.noSkills ? [] : resolvedSkills(settings, config, { homeDir: root })
+      });
+    };
+
+    // An existing host source leaves no gap on either side.
+    const devReport = presetCapabilities(config, "dev", { homeDir: root }).mountGaps;
+    assert.deepEqual(runSide("dev"), []);
+    assert.deepEqual(devReport, []);
+
+    // The missing source is named on both sides, with the reason intact.
+    const brokenRun = runSide("broken");
+    assert.deepEqual(
+      brokenRun,
+      [{ label: "skill", value: "/pi-skills/git-commit", reason: "missing-host-path", hostPath: path.join(hostDir, "absent") }]
+    );
+    assert.deepEqual(
+      presetCapabilities(config, "broken", { homeDir: root }).mountGaps,
+      brokenRun.map((gap) => gap.value),
+      "the report names the same gap the run path judges"
+    );
+  } finally {
+    fs.rmSync(hostDir, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the capability report and the run path judge the same sandbox (real build)", async (t) => {
+  // The full-build variant: the real buildRunSettings (worktree, read-only
+  // guard and all), not a hand-copied assembly — a copy can agree with the
+  // report while the actual run path answers differently. This needs a local
+  // docker daemon AND the sandbox image, which no test environment is promised
+  // to have; without them the case states so out loud via t.skip rather than
+  // pretending nothing was checked.
+  const { sandboxPreflight } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
+  const preflight = sandboxPreflight({ mode: "docker", image: "busybox" });
+  if (!preflight.ok) {
+    t.skip(`нужен локальный образ busybox (docker daemon + image): ${preflight.errors[0]}`);
+    return;
+  }
+
   const { buildRunSettings } = await import("../plugins/pi/scripts/pi-companion.mjs");
   const { execFileSync } = await import("node:child_process");
 
