@@ -101,6 +101,16 @@ const ADDITIVE_KEYS = new Set(["appendSystemPrompt", "extensions", "skills", "mo
  * later layer overrides the matching entry instead of piling a second one on
  * top: mounts by their container path, env by variable name.
  */
+/**
+ * Fields that are an argv rather than a set. Docker reads repeatable flags
+ * (`--security-opt`, `--device`, `--cap-add`) by position, so folding two
+ * identical flag tokens into one leaves the orphaned value standing where the
+ * image name belongs — the daemon then answers "invalid reference format",
+ * naming neither the flag nor the profile it came from. Duplicates are the
+ * caller's business: docker lets the last occurrence of a single-valued flag win.
+ */
+const POSITIONAL_KEYS = new Set(["args"]);
+
 const ADDITIVE_IDENTITY = {
   mounts: (value) => String(value).split(":")[1] ?? String(value),
   env: (value) => String(value).split("=")[0]
@@ -112,6 +122,9 @@ const ADDITIVE_IDENTITY = {
  * has to keep the profile's PATH, not replace it with one entry.
  */
 export function concatAdditive(key, base = [], layer = []) {
+  if (POSITIONAL_KEYS.has(key)) {
+    return [...base, ...layer];
+  }
   return concatUnique(base, layer, ADDITIVE_IDENTITY[key]);
 }
 

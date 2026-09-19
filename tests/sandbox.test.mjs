@@ -463,6 +463,45 @@ test("a profile can start from another profile", () => {
   assert.equal(sandbox.profile, undefined);
 });
 
+test("a docker flag repeated in a profile keeps both of its occurrences", () => {
+  // `args` is an argv, not a set: docker reads repeatable flags (--security-opt,
+  // --device, --cap-add) by position, so folding two identical flag tokens into
+  // one leaves the second value standing where the image name belongs and the
+  // daemon answers "invalid reference format" — a message that names neither
+  // the flag nor the profile it came from.
+  const profiles = {
+    base: { args: ["--cpus", "6"] },
+    hardened: {
+      profile: "base",
+      args: ["--security-opt", "seccomp=@sandbox/seccomp.json", "--security-opt", "systempaths=unconfined"]
+    }
+  };
+  const sandbox = normalizeSandbox("hardened", profiles);
+  assert.deepEqual(sandbox.args, [
+    "--cpus",
+    "6",
+    "--security-opt",
+    "seccomp=@sandbox/seccomp.json",
+    "--security-opt",
+    "systempaths=unconfined"
+  ]);
+
+  const args = buildDockerRunArgs({
+    sandbox,
+    piArgs: ["--mode", "rpc"],
+    cwd: "/work",
+    identity: IDENTITY,
+    homeDir: "/home/me",
+    env: {}
+  });
+  assert.equal(
+    args[args.indexOf("systempaths=unconfined") - 1],
+    "--security-opt",
+    "the second value still has its flag in front of it"
+  );
+  assert.deepEqual(args.slice(-3), [DEFAULT_SANDBOX_IMAGE, "--mode", "rpc"], "the image stands where docker expects it");
+});
+
 test("a profile cycle is reported instead of hanging", () => {
   const profiles = { a: { profile: "b" }, b: { profile: "a" } };
   assert.throws(() => normalizeSandbox("a", profiles), /extends itself/);
