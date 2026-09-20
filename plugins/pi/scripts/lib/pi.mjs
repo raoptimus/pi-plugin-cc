@@ -547,6 +547,9 @@ async function openCredentialProxy(sandbox, onProgress, model, jobId = null) {
       provider: sandbox.provider,
       model,
       authEntry: auth?.[sandbox.provider],
+      // Sampling params pinned on the plugin-config model record outrank the
+      // pi models.json registry (see startCredentialProxy).
+      samplingParams: sandbox.samplingParams ?? null,
       onWarning: (message) => onProgress?.({ phase: "working", message }),
       // Ties the per-request telemetry to the run; without it the proxy
       // measures nothing rather than writing rows nothing can be joined to.

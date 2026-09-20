@@ -4,146 +4,377 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { normalizeConfigLayer } from "../plugins/pi/scripts/lib/config.mjs";
+
 const UNIQUE = `${process.pid}-${Date.now()}`;
 
-/** Pool config with profiles the variants resolve to. */
-function poolConfig({ limit = 1, priority = null, models = null, entries = null } = {}) {
+/** A config in the owner's form: three arrays, models by global id. */
+function ownerFormConfig({ limit = 1, priority = null, aliases = null } = {}) {
   return {
-    concurrencyPools: {
-      [`alpha-${UNIQUE}`]: {
+    concurrencyPools: [
+      {
+        pool: `alpha-${UNIQUE}`,
         limit,
-        sandbox: "agent",
         ...(priority === null ? {} : { priority }),
-        default: "fast",
-        models: models ?? { fast: { model: "prov/fast" }, smart: { model: "prov/smart", thinking: "high" } }
+        ...(aliases ? { aliases } : {}),
+        models: [
+          { id: `fast-${UNIQUE}`, provider: "prov", name: "fast-model" },
+          { id: `smart-${UNIQUE}`, provider: "prov", name: "smart-model", thinking: "high" }
+        ]
       },
-      [`beta-${UNIQUE}`]: {
+      {
+        pool: `beta-${UNIQUE}`,
         limit,
-        sandbox: "agent",
         ...(priority === null ? {} : { priority }),
-        default: "fast",
-        models: { fast: { model: "prov2/fast" } }
+        models: [{ id: `other-${UNIQUE}`, provider: "prov2", name: "other-model" }]
       }
-    },
-    sandboxProfiles: {
-      agent: { image: "img" },
-      "agent-dind": { image: "img" }
-    },
-    presets: {
-      role: { pools: entries ?? [`alpha-${UNIQUE}:fast`, `beta-${UNIQUE}`] }
-    }
+    ],
+    sandboxServices: [
+      { id: "base", image: "busybox:latest", env: ["PATH=/toolchain"], mounts: ["/srv/base:/base:ro"], args: ["--cpus", "6"] },
+      {
+        id: "agent",
+        extend: "base",
+        image: "busybox:latest",
+        env: ["EXTRA=1"],
+        mounts: ["/srv/extra:/extra:ro"],
+        args: ["--security-opt", "no-new-privileges"]
+      }
+    ],
+    presets: [
+      {
+        id: "role",
+        models: [`fast-${UNIQUE}`, `other-${UNIQUE}`],
+        sandboxService: "agent"
+      }
+    ]
   };
 }
 
 function variantByPool(variants, poolName) {
-  return variants.find((variant) => variant.poolName === poolName);
+  return variants.find((variant) => variant.pool === poolName);
 }
 
-test("variants of one pool draw from one quota, and a bare number still reads as a limit", async () => {
-  const { applyConcurrencyPool, buildVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
+function variantById(variants, id) {
+  return variants.find((variant) => variant.id === id);
+}
+
+// Дословный пример владельца (спека B-52, раздел «ЦЕЛЕВАЯ ФОРМА»); содержимое
+// монтирований/env сокращено до маркеров, как в спеке, — важна структура.
+function ownerExampleLiteral() {
+  return {
+    sandboxServices: [
+      {
+        id: "sandbox-base",
+        image: "pi-sandbox-agent:latest",
+        dockerfile: "agent",
+        mounts: ["<14 монтирований базы: тулчейн, кэши volume, хуки, скилл vision>"],
+        env: ["<PATH, GOPROXY, GOPRIVATE, GOFLAGS, лимиты потоков BLAS — 12 строк>"],
+        extensions: ["/pi-agent/host-extensions/hooks/index.ts", "<lsp-адаптер>"],
+        args: ["--cpus", "6"],
+        skills: ["/pi-skills/vision"]
+      },
+      {
+        id: "sandbox-agent",
+        extend: "sandbox-base",
+        image: "pi-sandbox-agent:latest",
+        args: [
+          "--security-opt",
+          "seccomp=@sandbox/dind-seccomp.json",
+          "--security-opt",
+          "systempaths=unconfined",
+          "--device",
+          "/dev/net/tun",
+          "--add-host",
+          "host.docker.internal:host-gateway"
+        ],
+        env: [
+          "PI_DIND=1",
+          "DOCKERD_ROOTLESS_ROOTLESSKIT_FLAGS=--pidns",
+          "TESTCONTAINERS_RYUK_DISABLED=true",
+          "TESTCONTAINERS_HOST_OVERRIDE=127.0.0.1",
+          "PI_REGISTRY_MIRROR=http://host.docker.internal:5000"
+        ],
+        mounts: ["pi-dind-agent-images:/home/pi/.local/share/docker:isolate"]
+      }
+    ],
+    concurrencyPools: [
+      {
+        pool: "zai",
+        limit: 5,
+        priority: 10,
+        models: [
+          { id: "zai-glm-5.3", provider: "zai-coding-cn", name: "glm-5.3" },
+          { id: "zai-glm-5.3-flash", provider: "zai-coding-cn", name: "glm-5.3-flash" }
+        ]
+      },
+      {
+        pool: "vllm",
+        limit: 1,
+        priority: 10,
+        models: [
+          {
+            id: "vllm-Qwen3.8-27B",
+            provider: "vllm",
+            name: "Qwen3.8-27B",
+            samplingParams: { temperature: 1, max_tokens: 120000 }
+          },
+          {
+            id: "vllm-dev-Qwen3.8-27B",
+            provider: "vllm",
+            name: "Qwen3.8-27B",
+            samplingParams: { temperature: 0.8, max_tokens: 120000 }
+          }
+        ]
+      },
+      {
+        pool: "deepseek",
+        limit: 5,
+        priority: 10,
+        models: [
+          { id: "deepseek-deepseek-v4-pro", provider: "deepseek", name: "deepseek-v4-flash-pro" },
+          { id: "deepseek-deepseek-v4-flash", provider: "deepseek", name: "deepseek-v4-flash" }
+        ]
+      }
+    ],
+    presets: [
+      {
+        id: "go-developer",
+        models: ["zai-glm-5.3-flash", "deepseek-deepseek-v4-flash", "vllm-dev-Qwen3.8-27B"],
+        sandboxService: "sandbox-agent"
+      }
+    ]
+  };
+}
+
+test("the owner's example reads verbatim: three arrays become a preset with models and a service", async () => {
+  const { buildVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
+
+  const config = normalizeConfigLayer(ownerExampleLiteral());
+  assert.deepEqual(Object.keys(config.concurrencyPools), ["zai", "vllm", "deepseek"], "pool order is kept");
+  const service = config.sandboxProfiles["sandbox-agent"];
+  assert.equal(service.profile, "sandbox-base", "extend became the profile link");
+  assert.ok(service.env.includes("PI_DIND=1") && service.mounts[0].includes("dind"), "the child's own fields stay");
+
+  const { variants } = buildVariants(config.presets["go-developer"], config);
+  assert.deepEqual(
+    variants.map((variant) => variant.id),
+    ["zai-glm-5.3-flash", "deepseek-deepseek-v4-flash", "vllm-dev-Qwen3.8-27B"],
+    "the preset's listing order is the choice order when priorities tie"
+  );
+  const zai = variants[0];
+  assert.equal(zai.model, "zai-coding-cn/glm-5.3-flash");
+  assert.equal(zai.pool, "zai");
+  assert.equal(zai.sandbox.concurrencyGroup, "zai", "slots come from the pool of the model");
+  assert.equal(zai.sandbox.maxConcurrent, 5);
+  assert.equal(zai.sandbox.profileName, "sandbox-agent", "one sandbox for the role, named by the preset");
+
+  // Two ids may share one name and differ only in samplingParams.
+  const prod = config.concurrencyPools.vllm.models["vllm-Qwen3.8-27B"];
+  const dev = config.concurrencyPools.vllm.models["vllm-dev-Qwen3.8-27B"];
+  assert.equal(prod.name, dev.name);
+  assert.notDeepEqual(prod.samplingParams, dev.samplingParams);
+});
+
+test("duplicates and removed-form fields are refused by name", async () => {
+
+  const duplicate = ownerExampleLiteral();
+  duplicate.concurrencyPools.push({ pool: "zai", limit: 2, models: [] });
+  assert.throws(() => normalizeConfigLayer(duplicate), /Duplicate pool "zai".*concurrencyPools/);
+
+  const dupeService = ownerExampleLiteral();
+  dupeService.sandboxServices.push({ id: "sandbox-base", image: "x" });
+  assert.throws(() => normalizeConfigLayer(dupeService), /Duplicate id "sandbox-base"/);
+
+  const dupeModel = ownerFormConfig();
+  dupeModel.concurrencyPools[1].models.push({ id: `fast-${UNIQUE}`, provider: "prov2", name: "x" });
+  // The cross-pool duplicate is caught when the registry is built: within one
+  // layer the ids are unique per pool, uniqueness is global.
+  const { modelRegistry } = await import("../plugins/pi/scripts/pi-companion.mjs");
+  assert.throws(
+    () => modelRegistry(normalizeConfigLayer(dupeModel)),
+    new RegExp(`Model id "fast-${UNIQUE}" is defined in both pool.*globally unique`)
+  );
+
+  const dupeInPool = ownerFormConfig();
+  dupeInPool.concurrencyPools[0].models.push({ id: `fast-${UNIQUE}`, provider: "prov", name: "fast-model" });
+  assert.throws(() => normalizeConfigLayer(dupeInPool), new RegExp(`Duplicate model id "fast-${UNIQUE}"`));
+
+  const incomplete = ownerFormConfig();
+  delete incomplete.concurrencyPools[0].models[0].provider;
+  assert.throws(() => normalizeConfigLayer(incomplete), /needs "provider" and "name"/);
+
+  assert.throws(
+    () => normalizeConfigLayer({ presets: [{ id: "old", pools: ["zai:fast"] }] }),
+    /removed "pools" field.*"models"/,
+    "the cancelled pools form does not come back through a second door"
+  );
+  assert.throws(
+    () => normalizeConfigLayer({ presets: [{ id: "old", requires: ["dind"] }] }),
+    /removed "requires" field/
+  );
+  assert.throws(
+    () => normalizeConfigLayer({ concurrencyPools: [{ pool: "zai", limit: 1, default: "fast", models: [] }] }),
+    /removed "default" field/
+  );
+  assert.throws(
+    () => normalizeConfigLayer({ concurrencyPools: [{ pool: "zai", limit: 1, sandbox: "agent", models: [] }] }),
+    /removed "sandbox" field/
+  );
+  assert.throws(
+    () => normalizeConfigLayer({ concurrencyPools: [{ pool: "zai", limit: 1, models: { fast: {} } }] }),
+    /Named variant maps are gone/
+  );
+});
+
+test("extend folds the base's lists in; a cycle is refused with the chain", async () => {
+  const { normalizeSandbox } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
+
+  const config = normalizeConfigLayer(ownerFormConfig());
+  const agent = normalizeSandbox("agent", config.sandboxProfiles);
+  // The base's toolchain plus the child's own extras; args are positional and
+  // must survive in order, both halves of them.
+  assert.ok(agent.env.includes("PATH=/toolchain") && agent.env.includes("EXTRA=1"));
+  assert.ok(agent.mounts.includes("/srv/base:/base:ro") && agent.mounts.includes("/srv/extra:/extra:ro"));
+  const args = agent.args.join(" ");
+  assert.ok(args.includes("--cpus 6") && args.includes("--security-opt no-new-privileges"));
+
+  const cycle = normalizeConfigLayer(ownerFormConfig());
+  cycle.sandboxProfiles.a = { profile: "b" };
+  cycle.sandboxProfiles.b = { profile: "a" };
+  assert.throws(() => normalizeSandbox("a", cycle.sandboxProfiles), /extends itself: a → b/);
+});
+
+test("old forms keep working: maps, numeric pools, concurrencyGroup profiles", async () => {
+  const { normalizeConcurrencyPool, BUILT_IN_CONFIG, mergeConfigLayer } = await import(
+    "../plugins/pi/scripts/lib/config.mjs"
+  );
+  const { applyConcurrencyPool } = await import("../plugins/pi/scripts/pi-companion.mjs");
+  const { normalizeSandbox } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
+
+  assert.deepEqual(normalizeConcurrencyPool(7), { limit: 7 });
+
+  const today = {
+    concurrencyPools: { zai: 7 },
+    sandboxProfiles: { agent: { image: "busybox:latest", concurrencyGroup: "zai" } },
+    presets: { "python-developer-zai": { model: "zai/gpt-5", thinking: "high", sandbox: "agent" } }
+  };
+  // Normalization is a no-op on today's shape, apart from reading each numeric
+  // pool as its {limit} record.
+  assert.deepEqual(normalizeConfigLayer(today), {
+    concurrencyPools: { zai: { limit: 7 } },
+    sandboxProfiles: { agent: { image: "busybox:latest", concurrencyGroup: "zai" } },
+    presets: { "python-developer-zai": { model: "zai/gpt-5", thinking: "high", sandbox: "agent" } }
+  });
+
+  const merged = mergeConfigLayer(BUILT_IN_CONFIG, normalizeConfigLayer(today));
+  const sandbox = applyConcurrencyPool(normalizeSandbox("agent", merged.sandboxProfiles), merged);
+  assert.equal(sandbox.concurrencyGroup, "zai");
+  assert.equal(sandbox.maxConcurrent, 7);
+});
+
+test("a project layer with one pool does not wipe the user's pools, and cannot point models at a provider", async () => {
+  const { sanitizeProjectLayer, BUILT_IN_CONFIG, mergeConfigLayer } = await import(
+    "../plugins/pi/scripts/lib/config.mjs"
+  );
+
+  const user = normalizeConfigLayer(ownerFormConfig());
+  const projectWarnings = [];
+  const project = sanitizeProjectLayer(
+    normalizeConfigLayer({
+      concurrencyPools: [{ pool: `beta-${UNIQUE}`, limit: 9, models: [{ id: "x", provider: "evil", name: "m" }] }],
+      sandboxServices: [{ id: "sneaky", image: "img", mounts: ["/:/host:rw"], args: ["--privileged"] }]
+    }),
+    projectWarnings
+  );
+  const merged = mergeConfigLayer(mergeConfigLayer(BUILT_IN_CONFIG, user), project);
+
+  assert.equal(merged.concurrencyPools[`alpha-${UNIQUE}`].limit, 1, "the user's pool survives");
+  assert.equal(merged.concurrencyPools[`beta-${UNIQUE}`].limit, 9, "the project's capacity change lands");
+  assert.equal(
+    merged.concurrencyPools[`beta-${UNIQUE}`].models,
+    undefined,
+    "the project cannot decide which provider a pool's models hit"
+  );
+  assert.ok(projectWarnings.some((line) => line.includes("cannot point a pool's models")), JSON.stringify(projectWarnings));
+
+  // The trust boundary covers the new block exactly like the old one: a service
+  // is a profile once normalized, so its mounts and args are stripped.
+  assert.ok(projectWarnings.some((line) => line.includes("sneaky.sandbox.mounts ignored")), JSON.stringify(projectWarnings));
+  assert.equal(merged.sandboxProfiles.sneaky.mounts, undefined);
+  assert.equal(merged.sandboxProfiles.sneaky.args, undefined);
+});
+
+test("an unknown model id or service is refused with what is known, and provider/name gets a hint", async () => {
+  const { buildVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
+  const config = normalizeConfigLayer(ownerFormConfig());
+
+  assert.throws(
+    () => buildVariants({ models: [`ghost-${UNIQUE}`], sandbox: "agent" }, config),
+    new RegExp(`references model "ghost-${UNIQUE}".*Known models: fast-${UNIQUE}, smart-${UNIQUE}, other-${UNIQUE}`)
+  );
+  assert.throws(
+    () => buildVariants({ models: ["prov/fast-model"], sandbox: "agent" }, config),
+    /"prov\/fast-model" is provider\/name — address this model by its id/,
+    "the old addressing habit is named, not just refused"
+  );
+  assert.throws(
+    () => buildVariants({ models: [`fast-${UNIQUE}`], sandbox: "no-such-service" }, config),
+    /Unknown sandbox "no-such-service".*base, agent/
+  );
+});
+
+test("models of one pool share one quota, and a bare number still reads as a limit", async () => {
+  const { buildVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
   const { awaitSandboxSlot, describeSlotUsage } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
-  const { normalizeConcurrencyPool } = await import("../plugins/pi/scripts/lib/config.mjs");
-  const config = poolConfig({ limit: 1 });
-  const poolName = `alpha-${UNIQUE}`;
+  const config = normalizeConfigLayer(ownerFormConfig({ limit: 1 }));
+  config.presets.role.models = [`fast-${UNIQUE}`, `smart-${UNIQUE}`, `other-${UNIQUE}`];
   const { variants } = buildVariants(config.presets.role, config);
-  const fast = variantByPool(variants, poolName);
-  const beta = variantByPool(variants, `beta-${UNIQUE}`);
+  const fast = variantById(variants, `fast-${UNIQUE}`);
+  const smart = variantById(variants, `smart-${UNIQUE}`);
+  const other = variantById(variants, `other-${UNIQUE}`);
 
-  assert.equal(fast.sandbox.concurrencyGroup, poolName, "the pool is the quota scope, not the variant");
+  assert.equal(fast.sandbox.concurrencyGroup, fast.pool, "the pool is the quota scope, not the model");
   assert.equal(fast.sandbox.maxConcurrent, 1);
+  assert.equal(smart.sandbox.concurrencyGroup, fast.sandbox.concurrencyGroup, "same pool, same scope");
 
-  // A slot held by the `fast` variant must be visible to `smart` of the SAME
-  // pool, while a different pool with the same limit is untouched.
+  // A slot held by `fast` must be visible to `smart` of the SAME pool, while a
+  // different pool with the same limit is untouched.
   const claim = await awaitSandboxSlot(fast.sandbox, { timeoutMs: 1000, pollMs: 10 });
   try {
     assert.equal(describeSlotUsage(fast.sandbox).used, 1);
     await assert.rejects(
-      () => awaitSandboxSlot(fast.sandbox, { timeoutMs: 0, pollMs: 10 }),
+      () => awaitSandboxSlot(smart.sandbox, { timeoutMs: 0, pollMs: 10 }),
       /allows 1 container/,
-      "the second variant of one pool sees the first one's slot"
+      "the second model of one pool sees the first one's slot"
     );
-    const other = await awaitSandboxSlot(beta.sandbox, { timeoutMs: 1000, pollMs: 10 });
-    other.release();
+    const slot = await awaitSandboxSlot(other.sandbox, { timeoutMs: 1000, pollMs: 10 });
+    slot.release();
   } finally {
     claim.release();
   }
-
-  // Legacy shape: a number in concurrencyPools reads as {limit}, both through
-  // the normalizer and through the pool the profiles have drawn from before.
-  assert.deepEqual(normalizeConcurrencyPool(7), { limit: 7 });
-  const legacy = applyConcurrencyPool(
-    { profileName: "go", concurrencyGroup: "ollama-pro", maxConcurrent: 9 },
-    { concurrencyPools: { "ollama-pro": 7 } }
-  );
-  assert.equal(legacy.maxConcurrent, 7, "the pool number wins over the profile's own cap");
 });
 
-test("a preset chooses variants; the colon form addresses one and the pool carries model fields", async () => {
+test("pool priority orders the candidates; equal priorities keep the preset's listing order", async () => {
   const { buildVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
-  const config = poolConfig();
-  config.presets.mixed = { pools: [`alpha-${UNIQUE}:smart`, `beta-${UNIQUE}`], requires: ["dind"] };
-
-  const { variants } = buildVariants(config.presets.mixed, config);
-  const smart = variants[0];
-  // Model and thinking come from the pool variant, not from the preset: the
-  // preset picks, the pool decides what the variant is.
-  assert.equal(smart.model, "prov/smart");
-  assert.equal(smart.thinking, "high");
-  // The capability is the preset's ROLE: requires joins the pool's provider
-  // half into one profile, so a deepseek pool could serve a dind role too.
-  assert.equal(smart.sandbox.profileName, "agent-dind");
-
-  // The no-colon form takes the pool's default variant.
-  const plain = buildVariants(config.presets.role, config).variants;
-  assert.equal(variantByPool(plain, `alpha-${UNIQUE}`).model, "prov/fast", "default variant without a colon");
-  assert.equal(variantByPool(plain, `beta-${UNIQUE}`).model, "prov2/fast", "single-variant pool needs no default");
-
-  // Equipment named by the variant adds to the profile's own, it does not
-  // replace it.
-  const layered = poolConfig();
-  layered.concurrencyPools[`alpha-${UNIQUE}`].models.fast.env = ["POOL=1"];
-  layered.sandboxProfiles.agent.env = ["BASE=1"];
-  layered.sandboxProfiles.agent.mounts = ["/srv/base:/base:ro"];
-  layered.concurrencyPools[`alpha-${UNIQUE}`].models.fast.mounts = ["/srv/extra:/extra:ro"];
-  const { variants: equipped } = buildVariants(layered.presets.role, layered);
-  const sandbox = variantByPool(equipped, `alpha-${UNIQUE}`).sandbox;
-  assert.ok(sandbox.env.includes("BASE=1") && sandbox.env.includes("POOL=1"), "env folds");
-  assert.ok(sandbox.mounts.includes("/srv/base:/base:ro") && sandbox.mounts.includes("/srv/extra:/extra:ro"), "mounts fold");
-
-  assert.throws(
-    () => buildVariants({ pools: [`alpha-${UNIQUE}:nope`] }, config),
-    /no variant "nope".*fast, smart/s,
-    "a wrong variant name refuses and names what the pool has"
-  );
-  assert.throws(
-    () => buildVariants({ pools: [`ghost-${UNIQUE}`] }, config),
-    /concurrency pool "ghost-.*", which is not defined/
-  );
-});
-
-test("pool priority orders the variants; equal priorities keep the preset's listing order", async () => {
-  const { buildVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
-  const config = poolConfig({ priority: 5 });
-  // Listing order deliberately differs from the priority order: the pool
-  // default wins until the preset says otherwise.
-  config.concurrencyPools[`alpha-${UNIQUE}`].priority = 2;
+  const config = normalizeConfigLayer(ownerFormConfig());
+  config.concurrencyPools[`alpha-${UNIQUE}`].priority = 5;
   config.concurrencyPools[`beta-${UNIQUE}`].priority = 1;
 
-  const ordered = buildVariants(config.presets.role, config).variants.map((variant) => variant.poolName);
+  const ordered = buildVariants(config.presets.role, config).variants.map((variant) => variant.pool);
   assert.deepEqual(ordered, [`beta-${UNIQUE}`, `alpha-${UNIQUE}`], "smaller priority goes first");
 
-  // Equal priorities fall back to the order the preset listed the pools in,
-  // which is how a preset overrides the defaults without any extra field.
-  config.concurrencyPools[`alpha-${UNIQUE}`].priority = 1;
-  config.concurrencyPools[`beta-${UNIQUE}`].priority = 1;
-  const tied = buildVariants(config.presets.role, config).variants.map((variant) => variant.poolName);
-  assert.deepEqual(tied, [`alpha-${UNIQUE}`, `beta-${UNIQUE}`]);
+  // Equal priorities fall back to the order the preset listed the models in —
+  // the owner's example ties all pools at 10 and orders through the list.
+  config.concurrencyPools[`alpha-${UNIQUE}`].priority = 10;
+  config.concurrencyPools[`beta-${UNIQUE}`].priority = 10;
+  const tied = buildVariants(config.presets.role, config).variants.map((variant) => variant.id);
+  assert.deepEqual(tied, [`fast-${UNIQUE}`, `other-${UNIQUE}`]);
 });
 
-test("a busy pool is skipped after the wait threshold, and only an all-busy role queues", async () => {
+test("a busy pool is skipped after the wait threshold, and only an all-busy preset queues", async () => {
   const { buildVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
   const { awaitSandboxSlot, awaitVariantSlot } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
-  const config = poolConfig({ limit: 1 });
+  const config = normalizeConfigLayer(ownerFormConfig({ limit: 1 }));
   const { variants } = buildVariants(config.presets.role, config);
   const first = variants[0];
   const second = variants[1];
@@ -158,7 +389,7 @@ test("a busy pool is skipped after the wait threshold, and only an all-busy role
     const startedAt = Date.now();
     const picked = await awaitVariantSlot(variants, { poolWaitMs: 0, timeoutMs: 5000, onProgress });
     assert.ok(Date.now() - startedAt < 2000, "the busy pool is not queued past the zero threshold");
-    assert.equal(picked.poolName, second.poolName, "the free variant is taken instead of queuing");
+    assert.equal(picked.pool, second.pool, "the free pool is taken instead of queuing");
     picked.release();
   } finally {
     held.release();
@@ -168,12 +399,12 @@ test("a busy pool is skipped after the wait threshold, and only an all-busy role
   const slow = await awaitSandboxSlot(first.sandbox, { timeoutMs: 1000, pollMs: 10 });
   setTimeout(() => slow.release(), 150);
   const waited = await awaitVariantSlot(variants, { poolWaitMs: 5000, timeoutMs: 30000, onProgress });
-  assert.equal(waited.poolName, first.poolName, "the first by priority is waited for when it frees in time");
+  assert.equal(waited.pool, first.pool, "the first by priority is waited for when it frees in time");
   assert.ok(waited.waitedMs >= 100, "the wait actually happened");
   waited.release();
 
-  // Every variant busy: queue for the FIRST BY PRIORITY and say what for —
-  // a silent queue reads as a hang.
+  // Every pool busy: queue for the FIRST BY ORDER and say what for — a silent
+  // queue reads as a hang.
   const holdA = await awaitSandboxSlot(first.sandbox, { timeoutMs: 1000, pollMs: 10 });
   const holdB = await awaitSandboxSlot(second.sandbox, { timeoutMs: 1000, pollMs: 10 });
   try {
@@ -183,7 +414,9 @@ test("a busy pool is skipped after the wait threshold, and only an all-busy role
       "giving up is still the outcome when nothing frees"
     );
     assert.ok(
-      progress.some((message) => message.includes(`pool "${first.poolName}"`) && message.includes("first by priority")),
+      progress.some(
+        (message) => message.includes(`pool "${first.pool}"`) && message.includes("first by priority")
+      ),
       `the queue is announced: ${JSON.stringify(progress)}`
     );
   } finally {
@@ -192,90 +425,113 @@ test("a busy pool is skipped after the wait threshold, and only an all-busy role
   }
 });
 
-test("the old <role>-<pool> names resolve to the same variant as the role plus the pool", async () => {
+test("the chosen model's thinking and tags win over the preset's", async () => {
   const { buildVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
   const { resolveRunSettings } = await import("../plugins/pi/scripts/lib/config.mjs");
-  const config = poolConfig();
+  const config = normalizeConfigLayer(ownerFormConfig());
+  config.presets.role.models = [`fast-${UNIQUE}`, `smart-${UNIQUE}`, `other-${UNIQUE}`];
+  config.concurrencyPools[`alpha-${UNIQUE}`].models[`fast-${UNIQUE}`].thinking = "off";
+  config.concurrencyPools[`alpha-${UNIQUE}`].models[`fast-${UNIQUE}`].tags = ["local"];
+  config.concurrencyPools[`alpha-${UNIQUE}`].models[`smart-${UNIQUE}`].thinking = "low";
+  config.presets.role.thinking = "high";
+  config.presets.role.tags = ["role-tag"];
+
+  const variants = buildVariants(config.presets.role, config).variants;
+  assert.equal(variantById(variants, `fast-${UNIQUE}`).thinking, "off");
+  assert.equal(variantById(variants, `smart-${UNIQUE}`).thinking, "low");
+
+  // Through the settings layer: the preset's thinking is what resolves before a
+  // model is picked; the slot-time pick replaces it with the model's own, but a
+  // flag outranks both — hence the source is carried, not re-derived.
+  const settings = resolveRunSettings(config, "delegate", { preset: "role" });
+  assert.equal(settings.thinking, "high", "the preset's value stands until a model is chosen");
+  assert.deepEqual(settings.tags, ["role-tag"], "the preset's tags resolve per layer");
+  assert.equal(settings.thinkingFromFlag, false, "no flag, so the model may override");
+  const flagged = resolveRunSettings(config, "delegate", {
+    preset: "role",
+    thinking: "medium"
+  });
+  assert.equal(flagged.thinkingFromFlag, true, "a flag outranks the model record");
+});
+
+test("the old <role>-<pool> names resolve through pool, alias, or model id", async () => {
+  const { resolveRunSettings } = await import("../plugins/pi/scripts/lib/config.mjs");
+  const { buildVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
+  const config = normalizeConfigLayer(ownerFormConfig({ aliases: ["local"] }));
   config.presets.role.systemPrompt = "reviewer";
 
-  const direct = resolveRunSettings(config, "delegate", { preset: "role" });
-  const aliased = resolveRunSettings(config, "delegate", { preset: `role-beta-${UNIQUE}` });
-  assert.equal(aliased.presetName, direct.presetName, "the alias resolves onto the role preset");
-  assert.equal(aliased.presetPool, `beta-${UNIQUE}`);
-  assert.equal(aliased.requestedPresetName, `role-beta-${UNIQUE}`, "the request keeps the name that was asked for");
-  assert.equal(direct.requestedPresetName, direct.presetName);
+  const byPool = resolveRunSettings(config, "delegate", { preset: `role-beta-${UNIQUE}` });
+  assert.equal(byPool.presetName, "role", "the alias resolves onto the role preset");
+  assert.equal(byPool.presetPool, `beta-${UNIQUE}`);
+  assert.equal(byPool.requestedPresetName, `role-beta-${UNIQUE}`, "the request keeps the name that was asked for");
+
+  // Presets are called *-local, the pool is called beta: the alias bridges.
+  const byAlias = resolveRunSettings(config, "delegate", { preset: "role-local" });
+  assert.equal(byAlias.presetPool, `alpha-${UNIQUE}`, "the alias names the vllm-style pool, not a pool called local");
+
+  // A tail naming a model id pins that model's pool.
+  const byModel = resolveRunSettings(config, "delegate", { preset: `role-other-${UNIQUE}` });
+  assert.equal(byModel.presetPool, `beta-${UNIQUE}`);
 
   const pinned = buildVariants(config.presets.role, config, { poolPin: `beta-${UNIQUE}` });
-  const throughRole = buildVariants(config.presets.role, config);
-  const chosen = pinned.variants.map((variant) => `${variant.poolName}:${variant.variantName}`);
-  assert.deepEqual(
-    chosen,
-    throughRole.variants
-      .map((variant) => `${variant.poolName}:${variant.variantName}`)
-      .filter((name) => name.startsWith(`beta-${UNIQUE}`)),
-    "alias and role-plus-pool pick the same variant"
+  assert.deepEqual(pinned.variants.map((variant) => variant.pool), [`beta-${UNIQUE}`]);
+  assert.throws(
+    () => resolveRunSettings(config, "delegate", { preset: "role-ghost" }),
+    /Unknown preset/,
+    "an unmatched tail is a refusal, not a silent fall-back to the first model"
   );
-
-  // The alias only fires for a role that actually lists the pool; anything
-  // else stays an unknown preset.
-  assert.throws(() => resolveRunSettings(config, "delegate", { preset: "role-ghost" }), /Unknown preset/);
 });
 
-test("--model addresses a variant by name or by full id, or stays a literal override", async () => {
+test("--model addresses a model by id or provider/name, or stays a literal override", async () => {
   const { buildVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
-  const config = poolConfig();
-  // Without colons the entries carry the pools' defaults, so a --model can
-  // reach the non-default variant at all.
-  config.presets.pick = { pools: [`alpha-${UNIQUE}`, `beta-${UNIQUE}`] };
+  const config = normalizeConfigLayer(ownerFormConfig());
+  config.presets.role.models = [`fast-${UNIQUE}`, `smart-${UNIQUE}`, `other-${UNIQUE}`];
 
-  const byName = buildVariants(config.presets.pick, config, { modelWanted: "smart" });
-  assert.deepEqual(byName.variants.map((variant) => `${variant.poolName}:${variant.variantName}`), [
-    `alpha-${UNIQUE}:smart`
-  ]);
-  assert.equal(byName.modelOverride, null, "an addressed variant needs no override");
+  const byId = buildVariants(config.presets.role, config, { modelWanted: `smart-${UNIQUE}` });
+  assert.deepEqual(byId.variants.map((variant) => variant.id), [`smart-${UNIQUE}`]);
+  assert.equal(byId.modelOverride, null, "an addressed model needs no override");
 
-  const byId = buildVariants(config.presets.pick, config, { modelWanted: "prov/smart" });
-  assert.deepEqual(byId.variants.map((variant) => variant.model), ["prov/smart"]);
+  const byFullName = buildVariants(config.presets.role, config, { modelWanted: "prov2/other-model" });
+  assert.deepEqual(byFullName.variants.map((variant) => variant.id), [`other-${UNIQUE}`]);
 
-  const literal = buildVariants(config.presets.pick, config, { modelWanted: "other/model" });
-  assert.equal(literal.variants.length, 2, "an unknown model id pins nothing");
-  assert.equal(literal.modelOverride, "other/model", "it rides whichever variant wins the slot race");
+  const literal = buildVariants(config.presets.role, config, { modelWanted: "other/model" });
+  assert.equal(literal.variants.length, 3, "an unknown model pins nothing");
+  assert.equal(literal.modelOverride, "other/model", "it rides whichever candidate wins the slot race");
 });
 
-test("today's configuration keeps working unchanged", async () => {
-  const { applyConcurrencyPool } = await import("../plugins/pi/scripts/pi-companion.mjs");
-  const { normalizeSandbox } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
-  const { resolveRunSettings } = await import("../plugins/pi/scripts/lib/config.mjs");
-  const config = {
-    concurrencyPools: { zai: 7 },
-    sandboxProfiles: { agent: { image: "img", concurrencyGroup: "zai" } },
-    presets: {
-      "python-developer-zai": { model: "zai/gpt-5", thinking: "high", sandbox: "agent" }
-    },
-    poolWaitMs: 30000
-  };
+test("pia presets prints models with pools and the sandbox service", async () => {
+  const { presetPlansFor } = await import("../plugins/pi/scripts/pi-companion.mjs");
+  const { presetLines } = await import("../plugins/pi/scripts/lib/render.mjs");
+  const config = normalizeConfigLayer(ownerFormConfig());
+  const plans = presetPlansFor(config);
+  assert.deepEqual(
+    plans.role.models.map((model) => `${model.id} (${model.pool}, ${model.provider})`),
+    [`fast-${UNIQUE} (alpha-${UNIQUE}, prov)`, `other-${UNIQUE} (beta-${UNIQUE}, prov2)`]
+  );
+  assert.equal(plans.role.sandbox, "agent");
 
-  const settings = resolveRunSettings(config, "delegate", { preset: "python-developer-zai" });
-  assert.equal(settings.model, "zai/gpt-5");
-  assert.equal(settings.presetName, "python-developer-zai");
-  assert.equal(settings.presetPool, null, "an exact preset name pins nothing");
-  assert.equal(settings.sandboxVariants, undefined, "no variants are built for the old shape");
+  // A preset that cannot resolve degrades to no plan instead of muting others.
+  const broken = normalizeConfigLayer(ownerFormConfig());
+  broken.presets.broken = { id: "broken", models: ["no-such-id"], sandboxService: "agent" };
+  const tolerant = presetPlansFor(broken);
+  assert.equal(tolerant.broken, undefined);
+  assert.ok(tolerant.role, "the healthy preset is still listed");
 
-  const sandbox = applyConcurrencyPool(normalizeSandbox(settings.sandbox, config.sandboxProfiles), config);
-  assert.equal(sandbox.concurrencyGroup, "zai");
-  assert.equal(sandbox.maxConcurrent, 7);
+  const lines = presetLines({ role: { sandbox: "agent" } }, {}, {}, plans);
+  assert.match(lines[0], new RegExp(`models \`fast-${UNIQUE}\` \\(alpha-${UNIQUE}, prov\\)`));
+  assert.match(lines[0], /sandbox `agent`/);
 });
 
-test("the run path resolves a pools preset end to end", async (t) => {
+test("the run path resolves a models preset end to end", async (t) => {
   const { sandboxPreflight } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
-  const preflight = sandboxPreflight({ mode: "docker", image: "img" });
+  const preflight = sandboxPreflight({ mode: "docker", image: "busybox:latest" });
   if (!preflight.ok) {
     t.skip(`нужен локальный docker с образом-заглушкой: ${preflight.errors[0]}`);
     return;
   }
 
   const { buildRunSettings } = await import("../plugins/pi/scripts/pi-companion.mjs");
-  const config = poolConfig();
+  const config = normalizeConfigLayer(ownerFormConfig());
   config.presets.role.systemPrompt = "reviewer";
   const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-pools-"));
   try {
@@ -287,8 +543,12 @@ test("the run path resolves a pools preset end to end", async (t) => {
       config
     });
     assert.equal(settings.sandboxVariants.length, 2, "both pools became candidates");
-    assert.equal(settings.sandbox, settings.sandboxVariants[0].sandbox, "the first candidate stands in until slot time");
-    assert.equal(settings.model, null, "the model comes from the variant, picked at slot time");
+    // buildRunSettings reshapes the stand-in (identity env, isolateCaches), so
+    // compare the shape, not the object identity.
+    assert.equal(settings.sandbox.concurrencyGroup, settings.sandboxVariants[0].sandbox.concurrencyGroup,
+      "the first candidate stands in until slot time");
+    assert.equal(settings.sandbox.profileName, "agent");
+    assert.equal(settings.model, null, "the model comes from the candidate, picked at slot time");
     assert.equal(settings.poolWaitMs, 30000);
   } finally {
     fs.rmSync(workspaceRoot, { recursive: true, force: true });

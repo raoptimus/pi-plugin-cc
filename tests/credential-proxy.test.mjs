@@ -383,6 +383,64 @@ test("declared samplingParams reach the request pi omits them from", async () =>
   assert.equal(sent.model, "real-model-v2", "masking still applies");
 });
 
+// The plugin config pins `samplingParams` on a pool's model record — a more
+// specific source than the agent's models.json, so an equal key there must
+// lose. Without this, a local vLLM tuned in the plugin config would silently
+// run with whatever the catalogue copy says.
+test("samplingParams from the plugin config outrank the pi model registry", async () => {
+  const upstream = await startUpstream();
+  const home = homeWithSampling(upstream.port, { max_tokens: 111, temperature: 0.9 });
+  const proxy = await startCredentialProxy({
+    homeDir: home,
+    provider: "test-provider",
+    model: "test-provider/real-model-v2",
+    authEntry: { type: "api_key", key: "REAL-SECRET-KEY" },
+    samplingParams: { max_tokens: 120000, temperature: 1 }
+  });
+  const local = proxy.url.replace("host.docker.internal", "127.0.0.1");
+  try {
+    await fetch(`${local}/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${proxy.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "agent-model", messages: [{ role: "user", content: "hi" }] })
+    });
+    const sent = JSON.parse(upstream.seen[0].body);
+    assert.equal(sent.max_tokens, 120000, "the plugin config's ceiling wins over the registry's");
+    assert.equal(sent.temperature, 1, "the plugin config's temperature wins too");
+  } finally {
+    await proxy.close();
+    await upstream.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// The common case stays exactly as it was: only a model record that declares
+// sampling params changes anything.
+test("a model record without samplingParams still reads the pi registry", async () => {
+  const upstream = await startUpstream();
+  const home = homeWithSampling(upstream.port, { max_tokens: 777 });
+  const proxy = await startCredentialProxy({
+    homeDir: home,
+    provider: "test-provider",
+    model: "test-provider/real-model-v2",
+    authEntry: { type: "api_key", key: "REAL-SECRET-KEY" },
+    samplingParams: null
+  });
+  const local = proxy.url.replace("host.docker.internal", "127.0.0.1");
+  try {
+    await fetch(`${local}/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${proxy.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "agent-model", messages: [{ role: "user", content: "hi" }] })
+    });
+    assert.equal(JSON.parse(upstream.seen[0].body).max_tokens, 777);
+  } finally {
+    await proxy.close();
+    await upstream.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("what pi did set is left alone — the proxy fills gaps, it does not overrule", async () => {
   const sent = await withSamplingProxy(
     { max_tokens: 16384, temperature: 0.2 },

@@ -97,7 +97,7 @@ export function renderSetupReport(report) {
  * and the caller should not have to open a system prompt to answer it —
  * reading prompts to choose costs more than the choice.
  */
-export function presetLines(presets, capabilities = {}, limits = {}) {
+export function presetLines(presets, capabilities = {}, limits = {}, plans = {}) {
   const names = Object.keys(presets ?? {});
   if (!names.length) {
     return ["- none configured (add a `presets` block to `.claude/pi/config.json`)"];
@@ -109,7 +109,11 @@ export function presetLines(presets, capabilities = {}, limits = {}) {
     // mid-sentence with a "completed" status, and the choice between two presets
     // is often exactly this number. Absent when the catalogue was unreachable.
     const limit = limits[preset.model ?? ""] ?? null;
+    const plan = plans[name] ?? null;
     const details = [
+      // New form: a preference list of model ids, each with its pool and
+      // provider, in the order a run would try them.
+      plan ? `models ${plan.models.map((m) => `\`${m.id}\` (${m.pool}, ${m.provider})`).join(" → ")}` : null,
       preset.model
         ? `model \`${preset.model}\`${limit ? ` (ctx ${limit.context ?? "?"} · out ${limit.maxOutput ?? "?"})` : ""}`
         : null,
@@ -117,7 +121,11 @@ export function presetLines(presets, capabilities = {}, limits = {}) {
       preset.thinking ? `thinking \`${preset.thinking}\`` : null,
       preset.systemPrompt ? `prompt \`${preset.systemPrompt}\`` : null,
       preset.readOnly ? "read-only" : null,
-      preset.sandbox?.profile ? `sandbox \`${preset.sandbox.profile}\`` : null,
+      typeof preset.sandbox === "string"
+        ? `sandbox \`${preset.sandbox}\``
+        : preset.sandbox?.profile
+          ? `sandbox \`${preset.sandbox.profile}\``
+          : null,
       // Capabilities the preset does not state and the model does not carry:
       // a skill the profile mounts is invisible in both, and a caller that
       // cannot see it will route the work by the model's limits instead.
@@ -146,8 +154,8 @@ export function presetLines(presets, capabilities = {}, limits = {}) {
  * call takes over a second, which is too slow for anything that asks on every
  * invocation, such as a hook.
  */
-export function renderPresetsReport({ presets = {}, prompts = [], capabilities = {}, limits = {} } = {}) {
-  const lines = ["# pi presets", "", ...presetLines(presets, capabilities, limits)];
+export function renderPresetsReport({ presets = {}, prompts = [], capabilities = {}, limits = {}, plans = {} } = {}) {
+  const lines = ["# pi presets", "", ...presetLines(presets, capabilities, limits, plans)];
   if (prompts.length) {
     lines.push("", "## System prompts", "", prompts.map((name) => `- \`${name}\``).join("\n"));
   }

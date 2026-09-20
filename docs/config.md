@@ -43,6 +43,44 @@ Two fields deserve naming separately, because decisions live in them rather than
 
 Values resolve layer by layer, highest first: **command-line flags → preset → per-command defaults → global defaults.** Commit identity is the one exception: your gitconfig sits between the flags and the preset (see [git-identity.md](git-identity.md)). The system prompt is chosen as a unit, so `--system-prompt` replaces a preset's prompt outright; `appendSystemPrompt`, `extensions`, `skills` and `mounts` stack across layers instead.
 
+## Pools and model registries: one preset per role
+
+Twenty presets on eleven roles used to mean eleven copies of the same three lines that drift apart silently. The owner form collapses them: the preset lists models in preference order, and everything account-specific lives once, on the model record.
+
+```json
+{
+  "sandboxServices": [
+    { "id": "sandbox-base", "image": "pi-sandbox-agent:latest", "dockerfile": "agent",
+      "mounts": ["…toolchain, caches, hooks…"], "env": ["PATH=…", "GOPROXY=…"],
+      "args": ["--cpus", "6"], "skills": ["/pi-skills/vision"] },
+    { "id": "sandbox-agent", "extend": "sandbox-base", "image": "pi-sandbox-agent:latest",
+      "args": ["--security-opt", "seccomp=@sandbox/dind-seccomp.json", "--device", "/dev/net/tun"],
+      "env": ["PI_DIND=1"],
+      "mounts": ["pi-dind-agent-images:/home/pi/.local/share/docker:isolate"] }
+  ],
+  "concurrencyPools": [
+    { "pool": "zai", "limit": 5, "priority": 10,
+      "models": [ { "id": "zai-glm-5.3", "provider": "zai-coding-cn", "name": "glm-5.3" } ] }
+  ],
+  "presets": [
+    { "id": "go-developer",
+      "models": ["zai-glm-5.3", "deepseek-deepseek-v4-flash"],
+      "sandboxService": "sandbox-agent" }
+  ]
+}
+```
+
+All three blocks are written as **arrays** (the entry's `id`/`pool` is its key); they are converted to maps before config layers merge, so a project layer adding one pool does not wipe the user's. A duplicate key is a refusal that names it, never "last one wins".
+
+- **A model is an entity**: a globally unique `id`, the `provider`+`name` pair pi is addressed with as `provider/name`, and optional `samplingParams`, `thinking`, `tags`. Two ids may share one `name` and differ only in `samplingParams` — that is how a production and a debug variant of the same vLLM coexist. To tune a model for one role, add another record to the pool, not fields to the preset.
+- **`extend`** is the only parent a sandbox service has, and the new word for what profiles call `profile`: the lists (`env`, `mounts`, `args`, `extensions`, `skills`) add up, scalars are replaced, a cycle is refused with the chain. Services and `sandboxProfiles` share one namespace, and a service wins a name collision.
+- **The sandbox belongs to the preset** — one `sandboxService` per role, no per-provider halves. Slots come from the pool of the selected model: every model in one pool draws from the same `limit`, so two models of one account cannot exceed its allowance together.
+- **The choice order** is the pool's `priority` (smaller first), ties broken by the preset's own listing order. At run time the first candidate whose pool is free wins; a busy pool is skipped once waiting would exceed `poolWaitMs` (a config field, 30000 by default; `0` — only a pool free right now). When everything is busy the run queues for the first candidate and says so. The chosen model sets the run's `provider`, `model` (`provider/name`), and — overriding the preset — its `thinking`; its `tags` fold into the preset's. A `--thinking` flag still outranks everything.
+- **`samplingParams` of the chosen model** travel into the credential proxy and take precedence over the same keys in `~/.pi/agent/models.json`: the plugin config is the more specific source. A model without them behaves exactly as before.
+- **Old names keep working.** `go-developer-zai` resolves to the `go-developer` preset pinned to the pool the tail names — by pool name, by one of the pool's `aliases` (presets are called `*-local`, the pool is called `vllm`), or by a model id of the preset. An unmatched tail is a refusal, not a silent fall-back. `--model <id>` or `--model provider/name` addresses one model directly, past busy-pool skipping; anything else stays a literal model override.
+
+Today's shapes remain supported: `presets` and `sandboxProfiles` as maps, `concurrencyPools: {"zai": 7}` (a bare number of slots for profiles declaring `"concurrencyGroup": "zai"`), `sandbox` as a profile name or object.
+
 ## Budgets: stopping a run that costs too much
 
 Time used to be the only ceiling a run had, and it is a poor proxy for the thing worth bounding — a fast model can spend a dollar in two minutes, a cheap one can idle for an hour for free.

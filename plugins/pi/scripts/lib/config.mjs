@@ -46,9 +46,11 @@ const BUILT_IN = {
   // Named slot pools: `{"ollama-pro": 3}` means every profile that declares
   // `"concurrencyGroup": "ollama-pro"` draws from the same three slots. Optional
   // — a profile can also cap itself with `maxConcurrent` and share nothing.
-  // A pool may also be a full object: `{limit, sandbox, priority, models,
-  // default}` — the models being named variants (`fast`, `smart`) so a preset
-  // picks one of them instead of restating model/thinking per provider.
+  // A pool may also be a full object: `{limit, priority, aliases, models}` —
+  // the models being an array of records `{id, provider, name,
+  // samplingParams?, thinking?, tags?}` with globally unique ids, so a preset
+  // lists model ids instead of restating model/thinking per provider. The pool
+  // a model belongs to is where its record sits; the preset never names pools.
   concurrencyPools: {},
   // How long a run is willing to wait for a busy pool before moving on to the
   // next variant of the same role; 0 means "only a pool free right now".
@@ -69,11 +71,163 @@ const BUILT_IN = {
 };
 
 /**
+ * Turn one of the three owner-form blocks (`sandboxServices`,
+ * `concurrencyPools`, `presets`) from an array into a map keyed by the entry's
+ * own `id`/`pool` field, preserving order (a JS object keeps insertion order).
+ *
+ * The map is what every consumer downstream already reads, and the conversion
+ * has to happen BEFORE config layers merge: `mergeConfigLayer` merges named
+ * blocks entry by entry, so an array handed to it as-is would replace the
+ * whole block and a project layer adding one pool would wipe the user's.
+ * A duplicate key is a refusal, not "last one wins" — two pools answering to
+ * one name is a config bug the owner has to see spelled out.
+ */
+function normalizeNamedArray(entries, block, keyField) {
+  const map = {};
+  for (const entry of entries) {
+    if (!isPlainObject(entry)) {
+      throw new Error(`${block} entry must be an object, got ${JSON.stringify(entry) ?? "undefined"}.`);
+    }
+    const key = entry[keyField];
+    if (typeof key !== "string" || !key.trim()) {
+      throw new Error(`${block} entry needs a non-empty "${keyField}", got ${JSON.stringify(key ?? null)}.`);
+    }
+    if (map[key]) {
+      throw new Error(`Duplicate ${keyField} "${key}" in "${block}". Names must be unique within the block.`);
+    }
+    map[key] = entry;
+  }
+  return map;
+}
+
+/**
+ * Fields of the cancelled intermediate form. Keeping them as a second accepted
+ * spelling would leave two ways to say one thing, and the two drift — the
+ * exact failure this form exists to remove. A config carrying one is refused
+ * with the new spelling named, so migration is mechanical.
+ */
+function refuseRemovedField(where, field, instead) {
+  throw new Error(`${where} uses the removed "${field}" field. ${instead}`);
+}
+
+/**
+ * Read one model record of a pool's `models` array.
+ *
+ * A model is an entity with a globally unique `id` and the `provider`+`name`
+ * pair pi is addressed with (`provider/name`). Two ids may share one `name`
+ * and differ only in `samplingParams` — that is how a production and a debug
+ * variant of the same vLLM coexist.
+ */
+function normalizePoolModel(entry, poolName, index) {
+  const where = `Model #${index} of pool "${poolName}"`;
+  if (!isPlainObject(entry)) {
+    throw new Error(`${where} must be an object, got ${JSON.stringify(entry) ?? "undefined"}.`);
+  }
+  if (typeof entry.id !== "string" || !entry.id.trim()) {
+    throw new Error(`${where} needs a non-empty "id".`);
+  }
+  if (!entry.provider || !entry.name) {
+    throw new Error(
+      `Model "${entry.id}" of pool "${poolName}" needs "provider" and "name" — the pair pi is addressed with as provider/name.`
+    );
+  }
+  return entry;
+}
+
+function normalizePreset(preset, name) {
+  if (!isPlainObject(preset)) {
+    return preset;
+  }
+  if (preset.pools !== undefined) {
+    refuseRemovedField(
+      `Preset "${name}"`,
+      "pools",
+      'List model ids in preference order under "models" instead; the pool each model belongs to is where its record sits.'
+    );
+  }
+  if (preset.requires !== undefined) {
+    refuseRemovedField(
+      `Preset "${name}"`,
+      "requires",
+      'Name one sandbox for the role with "sandboxService"; the pool of the selected model provides the slots.'
+    );
+  }
+  if (preset.models !== undefined && !Array.isArray(preset.models)) {
+    throw new Error(`Preset "${name}" has "models" that is not an array of model ids.`);
+  }
+  if (preset.sandboxService !== undefined) {
+    // The preset's sandbox is a single named service, not per-provider halves.
+    // Translated to the field every consumer already reads (capability reports,
+    // `--sandbox` overrides, slot accounting) so there is no second path.
+    const translated = { ...preset, sandbox: preset.sandboxService };
+    delete translated.sandboxService;
+    return translated;
+  }
+  return preset;
+}
+
+/**
+ * Accept the owner-form arrays alongside the historical maps.
+ *
+ * `sandboxServices` and `sandboxProfiles` share one namespace (a service is
+ * the newer spelling of a profile, `extend` its word for `profile`), with the
+ * service winning a name collision — it is the more specific spelling. Pools
+ * keep the historical number-of-slots map untouched and gain the array form.
+ */
+export function normalizeConfigLayer(layer) {
+  if (!isPlainObject(layer)) {
+    return layer;
+  }
+  const clean = { ...layer };
+
+  if (Array.isArray(clean.sandboxServices)) {
+    const profiles = isPlainObject(clean.sandboxProfiles) ? clean.sandboxProfiles : {};
+    const merged = { ...profiles };
+    for (const service of Object.values(normalizeNamedArray(clean.sandboxServices, "sandboxServices", "id"))) {
+      const profile = { ...service };
+      delete profile.id;
+      if (profile.extend != null) {
+        profile.profile = profile.extend;
+        delete profile.extend;
+      }
+      merged[service.id] = profile;
+    }
+    clean.sandboxProfiles = merged;
+    delete clean.sandboxServices;
+  }
+
+  if (Array.isArray(clean.concurrencyPools)) {
+    clean.concurrencyPools = normalizeNamedArray(clean.concurrencyPools, "concurrencyPools", "pool");
+  }
+  if (isPlainObject(clean.concurrencyPools)) {
+    const pools = {};
+    for (const [name, pool] of Object.entries(clean.concurrencyPools)) {
+      pools[name] = normalizeConcurrencyPool(pool, name);
+    }
+    clean.concurrencyPools = pools;
+  }
+
+  if (Array.isArray(clean.presets)) {
+    clean.presets = normalizeNamedArray(clean.presets, "presets", "id");
+  }
+  if (isPlainObject(clean.presets)) {
+    const presets = {};
+    for (const [name, preset] of Object.entries(clean.presets)) {
+      presets[name] = normalizePreset(preset, name);
+    }
+    clean.presets = presets;
+  }
+  return clean;
+}
+
+/**
  * Read one `concurrencyPools` entry.
  *
  * The historical shape is a bare number of slots; it still reads as `{limit}`.
- * A full pool object carries the same limit plus the provider half of the
- * sandbox (`sandbox`), a `priority`, and named model variants under `models`.
+ * A full pool object carries the same limit, a `priority` (smaller runs
+ * earlier), optional `aliases` (presets are called `*-local` while the pool is
+ * `vllm`), and the model registry under `models` — an array of records keyed
+ * by their globally unique `id`.
  */
 export function normalizeConcurrencyPool(value, name = "pool") {
   if (typeof value === "number") {
@@ -87,6 +241,38 @@ export function normalizeConcurrencyPool(value, name = "pool") {
   const limit = Number(value.limit);
   if (!Number.isFinite(limit) || limit <= 0) {
     throw new Error(`Concurrency pool "${name}" needs a positive "limit", got ${JSON.stringify(value.limit ?? null)}.`);
+  }
+  if (value.default !== undefined) {
+    refuseRemovedField(
+      `Pool "${name}"`,
+      "default",
+      "A preset lists model ids in the order it prefers them; there is no per-pool default to fall back to."
+    );
+  }
+  if (value.sandbox !== undefined) {
+    refuseRemovedField(
+      `Pool "${name}"`,
+      "sandbox",
+      'The sandbox belongs to the preset ("sandboxService"); the pool of the selected model provides the slots.'
+    );
+  }
+  if (value.models !== undefined) {
+    if (!Array.isArray(value.models)) {
+      refuseRemovedField(
+        `Pool "${name}"`,
+        "models",
+        'Use the array form: [{"id": …, "provider": …, "name": …}, …]. Named variant maps are gone.'
+      );
+    }
+    const models = {};
+    value.models.forEach((entry, index) => {
+      const model = normalizePoolModel(entry, name, index);
+      if (models[model.id]) {
+        throw new Error(`Duplicate model id "${model.id}" in pool "${name}". Model ids are globally unique.`);
+      }
+      models[model.id] = model;
+    });
+    return { ...value, models };
   }
   return value;
 }
@@ -105,14 +291,42 @@ export function resolvePresetReference(config, name) {
     return { preset: presets[name], presetName: name, requestedName: name, poolPin: null };
   }
   // Pool names may contain dashes themselves, so the split point is not the
-  // last dash: match "<preset>-<pool>" against the pools each role lists.
+  // last dash: match "<preset>-<tail>" against what the role's model list
+  // implies. The tail may name a pool, one of its aliases (presets are called
+  // `*-local` while the pool is `vllm`), or a model id of the preset — the
+  // pinned pool is whichever of the three answers.
+  const pools = config.concurrencyPools ?? {};
   for (const [base, preset] of Object.entries(presets)) {
-    if (!preset || !Array.isArray(preset.pools) || !name.startsWith(`${base}-`)) {
+    if (!preset || !Array.isArray(preset.models) || !name.startsWith(`${base}-`)) {
       continue;
     }
     const tail = name.slice(base.length + 1);
-    if (preset.pools.some((entry) => String(entry).split(":")[0] === tail)) {
-      return { preset, presetName: base, requestedName: name, poolPin: tail };
+    let pin = null;
+    if (pools[tail] != null) {
+      pin = tail;
+    } else {
+      for (const [poolName, pool] of Object.entries(pools)) {
+        if (Array.isArray(pool?.aliases) && pool.aliases.map(String).includes(tail)) {
+          pin = poolName;
+          break;
+        }
+      }
+    }
+    if (!pin && preset.models.includes(tail)) {
+      pin = poolOfModel(pools, tail);
+    }
+    if (pin) {
+      return { preset, presetName: base, requestedName: name, poolPin: pin };
+    }
+  }
+  return null;
+}
+
+/** Which pool holds the model with this id, or null. */
+function poolOfModel(pools, id) {
+  for (const [poolName, pool] of Object.entries(pools)) {
+    if (isPlainObject(pool) && isPlainObject(pool.models) && pool.models[id]) {
+      return poolName;
     }
   }
   return null;
@@ -420,6 +634,25 @@ export function sanitizeProjectLayer(layer, warnings = []) {
     delete clean.gitProxy;
   }
 
+  if (isPlainObject(clean.concurrencyPools)) {
+    // A model record carries the provider the run authenticates against, so a
+    // project layer restating or adding models of a pool the host defines
+    // would be choosing whose endpoint the fleet's presets hit. Limits and
+    // priority are capacity, not identity: a project may still throttle or
+    // deprioritize a pool, it just cannot point its models anywhere.
+    const pools = {};
+    for (const [name, pool] of Object.entries(clean.concurrencyPools)) {
+      if (isPlainObject(pool) && pool.models !== undefined) {
+        warnings.push(`concurrencyPools.${name}.models ignored: the project config cannot point a pool's models at a provider.`);
+        const { models, ...rest } = pool;
+        pools[name] = rest;
+        continue;
+      }
+      pools[name] = pool;
+    }
+    clean.concurrencyPools = pools;
+  }
+
   if (isPlainObject(clean.defaults)) {
     clean.defaults = sanitizeUntrustedEntry(clean.defaults, "defaults", warnings);
   }
@@ -494,7 +727,10 @@ export function loadConfig(workspaceRoot) {
   }
   if (user.value) {
     sources.push(userConfigPath());
-    config = mergeConfigLayer(config, user.value);
+    // Owner-form arrays become maps before any merging: `mergeConfigLayer`
+    // merges named blocks entry by entry, and an array would replace the block
+    // whole — a project layer adding one pool would wipe the user's.
+    config = mergeConfigLayer(config, normalizeConfigLayer(user.value));
   }
 
   const trusted = isTrustedWorkspace(user.value, workspaceRoot);
@@ -505,7 +741,11 @@ export function loadConfig(workspaceRoot) {
   }
   if (project.value) {
     sources.push(projectConfigPath(workspaceRoot));
-    const layer = trusted ? stripHostExecution(project.value, warnings) : sanitizeProjectLayer(project.value, warnings);
+    // Normalized first: the sanitizer walks maps (`sandboxProfiles`,
+    // `concurrencyPools`), and a raw owner-form array would slip past it —
+    // exactly the mounts a service names would then reach docker untouched.
+    const normalized = normalizeConfigLayer(project.value);
+    const layer = trusted ? stripHostExecution(normalized, warnings) : sanitizeProjectLayer(normalized, warnings);
     config = mergeConfigLayer(config, layer);
   }
 
@@ -596,12 +836,19 @@ export function resolveRunSettings(config, command, overrides = {}) {
     model: pick("model"),
     provider: pick("provider"),
     thinking: pick("thinking"),
+    // A model record's `thinking` overrides the preset's (that is how
+    // `*-local` with `thinking: off` collapses into one preset with `*-zai`),
+    // but a flag outranks both — so the source is carried, not re-derived.
+    thinkingFromFlag: overrides.thinking != null,
     systemPrompt: promptSource.systemPrompt ?? null,
     // Appends stack across every layer instead of replacing each other.
     appendSystemPrompt: mergeLists("appendSystemPrompt"),
     tools: pick("tools"),
     excludeTools: pick("excludeTools"),
     readOnly,
+    // Preset-level tags, additive across layers; a chosen model's own tags are
+    // folded in at slot time, when the model is actually known.
+    tags: mergeLists("tags"),
     noTools: flagOf("noTools"),
     noBuiltinTools: flagOf("noBuiltinTools"),
     noExtensions: flagOf("noExtensions"),

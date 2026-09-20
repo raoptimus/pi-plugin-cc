@@ -1147,7 +1147,7 @@ export async function awaitVariantSlot(variants, { poolWaitMs = 30_000, timeoutM
   if (!Array.isArray(variants) || !variants.length) {
     throw new Error("No pool variants to choose from.");
   }
-  const describe = (variant) => `variant "${variant.variantName}" of pool "${variant.poolName}"`;
+  const describe = (variant) => `model "${variant.id}" of pool "${variant.pool}"`;
   for (const candidate of variants) {
     try {
       const slot = await awaitSandboxSlot(candidate.sandbox, { timeoutMs: Math.max(poolWaitMs, 0), pollMs });

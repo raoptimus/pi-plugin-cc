@@ -917,12 +917,24 @@ async function executeRun({
       timeoutMs: settings.timeoutMs,
       onProgress
     });
-    settings.sandbox = picked.sandbox;
-    settings.sandboxLabel = describeSandbox(picked.sandbox);
+    settings.sandbox = {
+      ...picked.sandbox,
+      // The proxy keys the credential on the provider of the model that won,
+      // not on whichever candidate stood in during preflight.
+      provider: picked.provider,
+      samplingParams: picked.samplingParams ?? undefined
+    };
+    settings.sandboxLabel = describeSandbox(settings.sandbox);
     settings.model = settings.model ?? picked.model;
-    settings.thinking = settings.thinking ?? picked.thinking;
-    if (picked.tags?.length) {
-      settings.tags = picked.tags;
+    settings.provider = settings.provider ?? picked.provider;
+    // The model record's thinking overrides the preset's — that is how
+    // `*-local` (thinking off) and `*-zai` (low) collapse into one preset. A
+    // command-line flag still outranks both, hence the source check.
+    if (picked.thinking != null && !settings.thinkingFromFlag) {
+      settings.thinking = picked.thinking;
+    }
+    if (picked.tags?.length || settings.tags?.length) {
+      settings.tags = [...(settings.tags ?? []), ...(picked.tags ?? [])];
     }
   }
 
@@ -1102,6 +1114,31 @@ async function commandSetup(argv, workspaceRoot) {
  * to" is asked constantly — by a person choosing, and by the hook that answers
  * the same question on every delegation.
  */
+/**
+ * The candidate models of every preset, in choice order.
+ *
+ * A broken preset yields no plan instead of throwing: this listing is what
+ * hooks and people consult when deciding whom to hand work to, and one bad
+ * entry must not mute the whole answer.
+ */
+export function presetPlansFor(config) {
+  const plans = {};
+  for (const [name, preset] of Object.entries(config.presets ?? {})) {
+    try {
+      const { variants } = buildVariants(preset, config);
+      if (variants.length) {
+        plans[name] = {
+          models: variants.map((variant) => ({ id: variant.id, pool: variant.pool, provider: variant.provider })),
+          sandbox: typeof preset.sandbox === "string" ? preset.sandbox : null
+        };
+      }
+    } catch {
+      // No plan for this preset; the error surfaces on the run itself.
+    }
+  }
+  return plans;
+}
+
 async function commandPresets(argv, workspaceRoot) {
   const { flags } = parseArgs(argv, { booleans: ["json"] });
   const { config } = loadConfig(workspaceRoot);
@@ -1111,7 +1148,12 @@ async function commandPresets(argv, workspaceRoot) {
     // Kept beside the presets rather than merged into them: these values are
     // derived, and a reader that cannot tell them apart from what the user
     // wrote will eventually write one back into the config.
-    capabilities: allPresetCapabilities(config)
+    capabilities: allPresetCapabilities(config),
+    // Per-preset candidate models (id, pool, provider) in choice order, plus
+    // the sandbox service. A preset that cannot resolve (unknown model id,
+    // unknown service) degrades to no plan rather than muting the listing —
+    // the same answer the capability column gives for a broken sandbox.
+    plans: presetPlansFor(config)
   };
   // Model limits cost a pass over the catalogue (~1s), so they are fetched only
   // for the human report: `presets --json` is what hooks call on every rejected
@@ -1191,98 +1233,103 @@ export function applyConcurrencyPool(sandbox, config) {
         `Add "concurrencyPools": {"${group}": <slots>} to the config, or drop concurrencyGroup.`
     );
   }
-  return { ...sandbox, maxConcurrent: Number(normalizeConcurrencyPool(raw, group).limit) };
+  // Already normalized with its layer; re-validating here would reject the
+  // pool's own model registry the normalizer just built.
+  const limit = typeof raw === "number" ? raw : Number(raw?.limit);
+  return { ...sandbox, maxConcurrent: limit };
 }
 
 /**
- * Expand a preset's `pools` list into the concrete variants it may run as.
+ * The model registry: every pool's `models` records indexed by their globally
+ * unique id. Built from the merged config at use time — pools are merged entry
+ * by entry across layers, so the registry reflects whatever layers survived.
+ */
+export function modelRegistry(config) {
+  const registry = new Map();
+  for (const [poolName, pool] of Object.entries(config?.concurrencyPools ?? {})) {
+    if (!isPlainObject(pool) || !isPlainObject(pool.models)) {
+      continue;
+    }
+    for (const [id, model] of Object.entries(pool.models)) {
+      if (registry.has(id)) {
+        throw new Error(
+          `Model id "${id}" is defined in both pool "${registry.get(id).pool}" and pool "${poolName}". Model ids are globally unique.`
+        );
+      }
+      registry.set(id, { ...model, id, pool: poolName });
+    }
+  }
+  return registry;
+}
+
+/**
+ * Expand a preset's `models` list into the concrete candidates it may run as.
  *
- * A pool entry is `"<pool>"` or `"<pool>:<variant>"`; the pool carries the
- * provider half of the sandbox and the slot quota, the named variant carries
- * model and thinking, and the preset's own `requires` names the capability the
- * profile must provide — the two halves join into one profile name
- * (`pool.sandbox` + `requires`, dashed). Model and thinking therefore live in
- * exactly one place per account, instead of being restated per provider in
- * thirty presets that drift apart silently.
+ * A model record carries provider, name and (optionally) thinking, tags and
+ * `samplingParams`; the preset lists ids in preference order and names one
+ * sandbox for the role. The pool each candidate draws slots from is the pool
+ * its record sits in — by construction every model of one account shares one
+ * quota (`concurrencyGroup = <pool>`, `maxConcurrent = pool.limit`), which is
+ * what makes two models of one account stay inside its allowance.
  *
- * `poolPin` (from a `<role>-<pool>` alias) and `modelWanted` (a `--model`
- * naming a variant or a full model id) address one variant directly, skipping
- * the busy-pool skipping — otherwise a concrete model could not be debugged.
- * A `--model` matching nothing stays a literal override and rides the variant
- * that wins the slot race (`modelOverride`).
+ * `poolPin` (from a `<role>-<pool|alias|modelId>` alias) narrows the candidates
+ * to one pool; `modelWanted` (a `--model` naming a model id or provider/name)
+ * addresses one model directly, past busy-pool skipping — otherwise a concrete
+ * model could not be debugged. A `--model` matching nothing stays a literal
+ * override and rides whichever candidate wins the slot race (`modelOverride`).
  */
 export function buildVariants(preset, config, { poolPin = null, modelWanted = null } = {}) {
-  const entries = Array.isArray(preset?.pools) ? preset.pools.map(String) : [];
-  if (!entries.length) {
+  const ids = Array.isArray(preset?.models) ? preset.models.map(String) : [];
+  if (!ids.length) {
     return { variants: [], modelOverride: modelWanted ?? null };
   }
+  const registry = modelRegistry(config);
   const pools = config.concurrencyPools ?? {};
-  const profiles = config.sandboxProfiles ?? {};
-  const requires = Array.isArray(preset.requires) ? preset.requires.map(String) : [];
-  const variants = [];
-  for (const entry of entries) {
-    const separator = entry.indexOf(":");
-    const poolName = separator === -1 ? entry : entry.slice(0, separator);
-    const wanted = separator === -1 ? null : entry.slice(separator + 1);
-    if (pools[poolName] == null) {
-      const known = Object.keys(pools);
+  // One sandbox for the role, resolved once: the preset names the service, the
+  // pool of the chosen model only adds the slot scope and its limit.
+  const roleSandbox = normalizeSandbox(preset.sandbox ?? null, config.sandboxProfiles ?? {});
+
+  const variants = ids.map((id, index) => {
+    const model = registry.get(id);
+    if (!model) {
+      const known = [...registry.keys()];
+      // The most common slip is addressing a model the old way, as
+      // provider/name. If the string names a model we do have, say so.
+      const alias = id.includes("/")
+        ? [...registry.values()].find((entry) => `${entry.provider}/${entry.name}` === id)
+        : null;
       throw new Error(
-        `Preset references concurrency pool "${poolName}", which is not defined.` +
-          (known.length ? ` concurrencyPools knows: ${known.join(",")}.` : "")
+        `Preset references model "${id}", which is not defined.` +
+          (known.length ? ` Known models: ${known.join(", ")}.` : "") +
+          (alias ? ` "${id}" is provider/name — address this model by its id "${alias.id}".` : "")
       );
     }
-    const pool = normalizeConcurrencyPool(pools[poolName], poolName);
-    const models = isPlainObject(pool.models) ? pool.models : {};
-    const names = Object.keys(models);
-    // A --model naming a variant of this pool — by variant name or by full
-    // model id — reaches it directly, past the entry's own default.
-    const addressedName =
-      modelWanted && (models[modelWanted] ? modelWanted : names.find((name) => models[name].model === modelWanted));
-    const variantName = wanted ?? addressedName ?? pool.default ?? (names.length === 1 ? names[0] : null);
-    if (!variantName) {
-      throw new Error(
-        `Pool "${poolName}" has several variants (${names.join(", ")}) and no "default"; address one as "${poolName}:<variant>".`
-      );
-    }
-    const variant = models[variantName];
-    if (!isPlainObject(variant)) {
-      throw new Error(
-        `Pool "${poolName}" has no variant "${variantName}".${names.length ? ` Known variants: ${names.join(", ")}.` : ""}`
-      );
-    }
-    const profileName = [pool.sandbox, ...requires].filter(Boolean).join("-");
-    if (!profiles[profileName]) {
-      throw new Error(
-        `Pool "${poolName}" with requires [${requires.join(", ")}] resolves to sandbox profile "${profileName}", ` +
-          `which is not defined.${Object.keys(profiles).length ? ` sandboxProfiles knows: ${Object.keys(profiles).join(", ")}.` : ""}`
-      );
-    }
-    // Slots are counted per pool by construction: both halves of the sandbox
-    // name the same group, so variants of one account share one quota.
+    const pool = pools[model.pool] ?? {};
+    // Already normalized with the layer; the limit is read, not re-validated.
+    const limit = Number(pool.limit);
     const sandbox = {
-      ...normalizeSandbox(profileName, profiles),
-      concurrencyGroup: poolName,
-      maxConcurrent: Number(pool.limit)
+      ...roleSandbox,
+      concurrencyGroup: model.pool,
+      maxConcurrent: limit,
+      ...(isPlainObject(model.samplingParams) ? { samplingParams: model.samplingParams } : {})
     };
-    for (const key of ["env", "mounts", "skills"]) {
-      if (Array.isArray(variant[key])) {
-        sandbox[key] = concatAdditive(key, sandbox[key], variant[key]);
-      }
-    }
-    variants.push({
-      poolName,
-      variantName,
+    return {
+      id,
+      pool: model.pool,
       priority: Number(pool.priority ?? Number.POSITIVE_INFINITY),
-      model: variant.model ?? null,
-      thinking: variant.thinking ?? null,
-      tags: Array.isArray(variant.tags) ? variant.tags : [],
+      provider: model.provider,
+      model: `${model.provider}/${model.name}`,
+      thinking: model.thinking ?? null,
+      tags: Array.isArray(model.tags) ? model.tags : [],
+      samplingParams: isPlainObject(model.samplingParams) ? model.samplingParams : null,
       sandbox
-    });
-  }
-  let chosen = poolPin ? variants.filter((variant) => variant.poolName === poolPin) : variants;
+    };
+  });
+
+  let chosen = poolPin ? variants.filter((variant) => variant.pool === poolPin) : variants;
   let modelOverride = null;
   if (modelWanted) {
-    const addressed = chosen.filter((variant) => variant.variantName === modelWanted || variant.model === modelWanted);
+    const addressed = chosen.filter((variant) => variant.id === modelWanted || variant.model === modelWanted);
     if (addressed.length) {
       chosen = addressed;
     } else {
@@ -1290,7 +1337,8 @@ export function buildVariants(preset, config, { poolPin = null, modelWanted = nu
     }
   }
   // Stable: equal priorities keep the preset's own listing order, so the list
-  // doubles as a tie-break and an explicit listing outranks the pool defaults.
+  // doubles as a tie-break — the owner's example gives every pool priority 10
+  // and puts vLLM last in the list, and that listing order is what must hold.
   return {
     variants: chosen
       .map((variant, index) => [variant, index])
