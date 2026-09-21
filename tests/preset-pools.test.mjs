@@ -838,8 +838,8 @@ test("a project layer's sandboxServices lose env and image, with a warning namin
   assert.ok(warnings.some((line) => line.includes("sneaky.sandbox.image ignored")), JSON.stringify(warnings));
 });
 
-// Т-3: extensions и skills тоже складываются через extend — скиллы и хостовые
-// расширения базы обязаны достаться ребёнку, иначе его контейнер без правил.
+// Т-3: extensions и skills тоже складываются через extend — частичный список
+// ребёнка не отменяет унаследованный, иначе его контейнер без правил базы.
 test("extend carries extensions and skills to the child", async () => {
   const { normalizeConfigLayer } = await import("../plugins/pi/scripts/lib/config.mjs");
   const { normalizeSandbox } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
@@ -849,16 +849,26 @@ test("extend carries extensions and skills to the child", async () => {
       {
         id: "base",
         image: "img",
-        extensions: ["/pi-agent/host-extensions/hooks/index.ts"],
+        extensions: ["/pi-agent/host-extensions/hooks/index.ts", "/pi-agent/host-extensions/lsp.ts"],
         skills: ["/pi-skills/vision"]
       },
-      { id: "child", extend: "base", args: ["--cpus", "2"] }
+      {
+        id: "child",
+        extend: "base",
+        args: ["--cpus", "2"],
+        extensions: ["/pi-agent/host-extensions/dind.ts"],
+        skills: ["/pi-skills/git-commit"]
+      }
     ]
   });
 
   const child = normalizeSandbox("child", config.sandboxProfiles);
-  assert.deepEqual(child.extensions, ["/pi-agent/host-extensions/hooks/index.ts"]);
-  assert.deepEqual(child.skills, ["/pi-skills/vision"]);
+  assert.deepEqual(child.extensions, [
+    "/pi-agent/host-extensions/hooks/index.ts",
+    "/pi-agent/host-extensions/lsp.ts",
+    "/pi-agent/host-extensions/dind.ts"
+  ], "the base's extensions survive beside the child's own");
+  assert.deepEqual(child.skills, ["/pi-skills/vision", "/pi-skills/git-commit"]);
   assert.ok(child.args.includes("--cpus"), "the child's own fields stay");
 });
 
