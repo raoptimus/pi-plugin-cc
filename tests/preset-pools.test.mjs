@@ -469,7 +469,13 @@ test("pool priority orders the candidates; equal priorities keep the preset's li
   config.concurrencyPools[`beta-${UNIQUE}`].priority = 1;
 
   const ordered = buildVariants(config.presets.role, config).variants.map((variant) => variant.pool);
-  assert.deepEqual(ordered, [`beta-${UNIQUE}`, `alpha-${UNIQUE}`], "smaller priority goes first");
+  assert.deepEqual(ordered, [`alpha-${UNIQUE}`, `beta-${UNIQUE}`], "bigger priority goes first");
+
+  // A pool that states no priority is the fallback, not the first choice: the
+  // reverse default sent every run to the unranked pool.
+  delete config.concurrencyPools[`beta-${UNIQUE}`].priority;
+  const unranked = buildVariants(config.presets.role, config).variants.map((variant) => variant.pool);
+  assert.deepEqual(unranked, [`alpha-${UNIQUE}`, `beta-${UNIQUE}`], "a pool with no priority sorts last");
 
   // Equal priorities fall back to the order the preset listed the models in —
   // the owner's example ties all pools at 10 and orders through the list.

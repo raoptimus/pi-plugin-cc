@@ -1467,7 +1467,10 @@ export function buildVariants(preset, config, { poolPin = null, modelWanted = nu
     return {
       id,
       pool: model.pool,
-      priority: Number(pool.priority ?? Number.POSITIVE_INFINITY),
+      // Bigger is better, so a pool that states no priority must sort LAST —
+      // negative infinity, not positive. The pool of a model nobody ranked is
+      // the fallback, never the first choice.
+      priority: Number(pool.priority ?? Number.NEGATIVE_INFINITY),
       provider: model.provider,
       model: `${model.provider}/${model.name}`,
       thinking: model.thinking ?? null,
@@ -1486,13 +1489,17 @@ export function buildVariants(preset, config, { poolPin = null, modelWanted = nu
       modelOverride = modelWanted;
     }
   }
+  // Higher priority runs first. The number is read the way people write it —
+  // 10 beats 1 — because the other reading cost a live run: the owner ranked
+  // the local vLLM `1` meaning "last resort", the code read it as "first in
+  // line", and every developer role went to the single-slot local model.
+  //
   // Stable: equal priorities keep the preset's own listing order, so the list
-  // doubles as a tie-break — the owner's example gives every pool priority 10
-  // and puts vLLM last in the list, and that listing order is what must hold.
+  // doubles as a tie-break.
   return {
     variants: chosen
       .map((variant, index) => [variant, index])
-      .sort((a, b) => a[0].priority - b[0].priority || a[1] - b[1])
+      .sort((a, b) => b[0].priority - a[0].priority || a[1] - b[1])
       .map(([variant]) => variant),
     modelOverride
   };

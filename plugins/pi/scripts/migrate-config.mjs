@@ -530,13 +530,13 @@ function buildFamily(role, members, priorities, serviceOf) {
     })
   );
 
-  // Preference order: the pool's priority (smaller first); equal priorities
-  // keep the listing the owner's example asks for — local vLLM last.
+  // Preference order: the pool's priority, BIGGER first (10 beats 1); equal
+  // priorities keep the listing the owner's example asks for — local vLLM last.
   const poolRank = new Map(
     [...priorities.keys()].sort((a, b) => Number(a === "vllm") - Number(b === "vllm")).map((pool, index) => [pool, index])
   );
   const ordered = [...members.entries()].sort(
-    (a, b) => (priorities.get(a[0]) ?? 0) - (priorities.get(b[0]) ?? 0) || (poolRank.get(a[0]) ?? 0) - (poolRank.get(b[0]) ?? 0)
+    (a, b) => (priorities.get(b[0]) ?? 0) - (priorities.get(a[0]) ?? 0) || (poolRank.get(a[0]) ?? 0) - (poolRank.get(b[0]) ?? 0)
   );
 
   const preset = {

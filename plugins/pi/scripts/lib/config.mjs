@@ -251,9 +251,10 @@ export function normalizeConfigLayer(layer) {
  * Read one `concurrencyPools` entry.
  *
  * The historical shape is a bare number of slots; it still reads as `{limit}`.
- * A full pool object carries the same limit, a `priority` (smaller runs
- * earlier) and the model registry under `models` — an array of records keyed
- * by their globally unique `id`.
+ * A full pool object carries the same limit, a `priority` (BIGGER runs earlier
+ * — the number is a rank the way people write it, 10 beating 1) and the model
+ * registry under `models` — an array of records keyed by their globally unique
+ * `id`.
  */
 export function normalizeConcurrencyPool(value, name = "pool") {
   if (typeof value === "number") {

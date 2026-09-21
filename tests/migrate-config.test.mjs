@@ -120,15 +120,19 @@ test("Т-2: семейство схлопывается в один пресет
   assert.equal(reviewer.systemPrompt, "reviewer");
 });
 
-test("Т-3: равные приоритеты — vLLM последней; меньший приоритет пула ставит его первым", () => {
+test("Т-3: равные приоритеты — vLLM последней; БОЛЬШИЙ приоритет пула ставит его первым", () => {
   const raw = liveFleet();
   const even = migrateConfig(raw).config.presets.find((preset) => preset.id === "go-developer");
   assert.deepEqual(even.models, ["zai-glm-5.3-flash", "deepseek-deepseek-v4-flash", "vllm-Qwen3.8-27B"]);
 
   const uneven = liveFleet();
+  // Приоритет читается как ранг: 10 старше 1. Пул, которому владелец поставил
+  // единицу, уходит В КОНЕЦ — именно этого ждёт человек, пишущий «1» в смысле
+  // «на крайний случай». Обратное чтение стоило живого прогона: локальная
+  // модель с единицей забирала все роли себе.
   uneven.concurrencyPools = { zai: 7, deepseek: { limit: 7, priority: 1 }, vllm: 1 };
   const odd = migrateConfig(uneven).config.presets.find((preset) => preset.id === "go-developer");
-  assert.deepEqual(odd.models, ["deepseek-deepseek-v4-flash", "zai-glm-5.3-flash", "vllm-Qwen3.8-27B"]);
+  assert.deepEqual(odd.models, ["zai-glm-5.3-flash", "vllm-Qwen3.8-27B", "deepseek-deepseek-v4-flash"]);
 });
 
 test("Т-4: живая раскладка — трио схлопывается в один dind-сервис; база и lite остаются отдельными", () => {
