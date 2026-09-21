@@ -470,3 +470,44 @@ test("фикс-раунд 3: сверка «группа слотов = пул»
     `expected the mismatch to name both pools, got: ${problems.join(" | ")}`
   );
 });
+
+// Фикс-раунд 3: собственный слотовый кап профиля без группы не исчезает молча.
+
+test("фикс-раунд 3: maxConcurrent без concurrencyGroup — отказ с именем профиля", () => {
+  const raw = liveFleet();
+  // agent-base — единственный профиль без группы: у остальных группа
+  // наследуется/задана, и кап рядом с ней легален (его срежет пул).
+  raw.sandboxProfiles["agent-base"].maxConcurrent = 2;
+  assert.throws(
+    () => migrateConfig(raw),
+    (error) => {
+      assert.match(error.message, /agent-base/);
+      assert.match(error.message, /maxConcurrent/);
+      assert.match(error.message, /without a concurrencyGroup/);
+      return true;
+    }
+  );
+});
+
+test("фикс-раунд 3: сверка не срезает maxConcurrent у профиля без группы", () => {
+  // Ручная пара: старое имя держит собственный кап 2 и никуда из него не
+  // переезжает; контур сверки обязан увидеть расхождение, если новая сторона
+  // кап потеряла (срезка как «переносимого в пул» делала сведение слепым).
+  const old = {
+    presets: { p: { model: "ax/m", sandbox: "prof" } },
+    sandboxProfiles: { prof: { maxConcurrent: 2 } },
+    concurrencyPools: { ax: 4 }
+  };
+  const freshNoCap = {
+    presets: { p: { models: ["ax-m"], sandboxService: "svc" } },
+    sandboxServices: [{ id: "svc" }],
+    concurrencyPools: [{ pool: "ax", limit: 4, models: [{ id: "ax-m", provider: "ax", name: "m" }] }]
+  };
+  assert.ok(
+    verifyEquivalence(old, freshNoCap).some((line) => line.includes("maxConcurrent") || line.includes("sandbox")),
+    "a lost standalone cap must surface in the equivalence proof"
+  );
+  const freshWithCap = JSON.parse(JSON.stringify(freshNoCap));
+  freshWithCap.sandboxServices[0].maxConcurrent = 2;
+  assert.deepEqual(verifyEquivalence(old, freshWithCap), [], "matching caps prove equivalent");
+});

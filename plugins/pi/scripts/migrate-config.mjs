@@ -219,6 +219,18 @@ function resolvedProfiles(config) {
   const resolved = new Map();
   for (const [name, profile] of Object.entries(config.sandboxProfiles ?? {})) {
     const full = normalizeSandbox(name, config.sandboxProfiles ?? {});
+    // Старый рантайм чтит собственный лимит профиля именно БЕЗ группы
+    // (applyConcurrencyPool: нет группы — песочница как есть). В новой форме
+    // слоты всегда приходят из пула и перекрывают сервисный лимит, поэтому
+    // перенести такой кап некуда — молча снять его значит сменить слотовый
+    // учёт без ведома владельца.
+    if (full.maxConcurrent !== undefined && full.concurrencyGroup === undefined) {
+      throw new Error(
+        `Sandbox profile "${name}" sets maxConcurrent (= ${JSON.stringify(full.maxConcurrent)}) without a concurrencyGroup. ` +
+          "The new form takes slots from the model's pool, so this standalone cap would be lost — " +
+          "drop the cap or give the profile a group by hand."
+      );
+    }
     for (const field of POOL_PORTABLE_FIELDS) {
       delete full[field];
     }
@@ -861,10 +873,14 @@ export function verifyEquivalence(oldRaw, newRaw, declared = []) {
         return null;
       }
       const full = normalizeSandbox(sandbox, config.sandboxProfiles ?? {});
+      // maxConcurrent срезается только вместе с группой: у профиля без группы
+      // собственный лимит — то, что старый рантайм реально чтит, и сверка
+      // обязана видеть его расхождение, а не слепо стирать.
+      const grouped = full.concurrencyGroup != null;
       delete full.concurrencyGroup;
-      for (const field of POOL_PORTABLE_FIELDS) {
-      delete full[field];
-    }
+      if (grouped) {
+        delete full.maxConcurrent;
+      }
       delete full.profileName;
       return full;
     };
