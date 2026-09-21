@@ -554,3 +554,52 @@ test("the run path resolves a models preset end to end", async (t) => {
     fs.rmSync(workspaceRoot, { recursive: true, force: true });
   }
 });
+
+// The slot-time pick used to rebuild `settings.sandbox` from `picked.sandbox`
+// — the raw role sandbox — dropping everything buildRunSettings had developed:
+// cache isolation, git proxy hosts, the run's own mounts and the git identity
+// env. A pooled run then went out without any of it, silently.
+test("the slot-time pick keeps the developed sandbox and moves only model-choice fields", async () => {
+  const { applyPickedVariant } = await import("../plugins/pi/scripts/pi-companion.mjs");
+  const settings = {
+    sandbox: {
+      mode: "docker",
+      image: "busybox:latest",
+      provider: "stand-in",
+      profileName: "agent",
+      isolateCaches: true,
+      gitProxyHosts: { "github.com": "127.0.0.1:0" },
+      mounts: ["/need:/need:ro"],
+      env: ["GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t"],
+      concurrencyGroup: `alpha-${UNIQUE}`,
+      maxConcurrent: 1
+    },
+    thinking: "high",
+    tags: ["role-tag"]
+  };
+  applyPickedVariant(settings, {
+    provider: "prov",
+    model: "prov/smart-model",
+    thinking: "low",
+    tags: ["model-tag"],
+    samplingParams: { max_tokens: 4096 },
+    sandbox: { concurrencyGroup: `beta-${UNIQUE}`, maxConcurrent: 2, heldSlot: { waitedMs: 5, release: () => {} } }
+  });
+
+  assert.equal(settings.sandbox.isolateCaches, true, "cache isolation survives the pick");
+  assert.deepEqual(settings.sandbox.gitProxyHosts, { "github.com": "127.0.0.1:0" }, "git proxy hosts survive");
+  assert.deepEqual(settings.sandbox.mounts, ["/need:/need:ro"], "declared mounts survive");
+  assert.ok(
+    settings.sandbox.env.includes("GIT_AUTHOR_NAME=t") && settings.sandbox.env.includes("GIT_AUTHOR_EMAIL=t@t"),
+    "git identity env survives"
+  );
+  assert.equal(settings.sandbox.provider, "prov", "the winner's provider keys the credential proxy");
+  assert.deepEqual(settings.sandbox.samplingParams, { max_tokens: 4096 });
+  assert.equal(settings.sandbox.concurrencyGroup, `beta-${UNIQUE}`, "the pool fields follow the winner");
+  assert.equal(settings.sandbox.maxConcurrent, 2);
+  assert.equal(settings.sandbox.heldSlot.waitedMs, 5, "the claimed slot travels in the sandbox");
+  assert.equal(settings.model, "prov/smart-model");
+  assert.equal(settings.provider, "prov");
+  assert.equal(settings.thinking, "low", "the model record's thinking overrides the preset's");
+  assert.deepEqual(settings.tags, ["role-tag", "model-tag"]);
+});

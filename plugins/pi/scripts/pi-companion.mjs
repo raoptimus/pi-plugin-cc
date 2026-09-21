@@ -884,6 +884,37 @@ function rerunRecipe(settings) {
 }
 
 /**
+ * Fold the candidate that won the slot race into the already developed
+ * settings. Only model-choice fields move; the developed sandbox (cache
+ * isolation, git proxy hosts, mounts, git identity) and its read-only guards
+ * must survive the pick — they belong to the workspace, not to the model.
+ */
+export function applyPickedVariant(settings, picked) {
+  settings.sandbox = {
+    ...settings.sandbox,
+    // The proxy keys the credential on the provider of the model that won,
+    // not on whichever candidate stood in during preflight.
+    provider: picked.provider,
+    samplingParams: picked.samplingParams ?? undefined,
+    concurrencyGroup: picked.sandbox.concurrencyGroup,
+    maxConcurrent: picked.sandbox.maxConcurrent,
+    ...(picked.sandbox.heldSlot ? { heldSlot: picked.sandbox.heldSlot } : {})
+  };
+  settings.sandboxLabel = describeSandbox(settings.sandbox);
+  settings.model = settings.model ?? picked.model;
+  settings.provider = settings.provider ?? picked.provider;
+  // The model record's thinking overrides the preset's — that is how
+  // `*-local` (thinking off) and `*-zai` (low) collapse into one preset. A
+  // command-line flag still outranks both, hence the source check.
+  if (picked.thinking != null && !settings.thinkingFromFlag) {
+    settings.thinking = picked.thinking;
+  }
+  if (picked.tags?.length || settings.tags?.length) {
+    settings.tags = [...(settings.tags ?? []), ...(picked.tags ?? [])];
+  }
+}
+
+/**
  * Shared execution path for delegate and review.
  */
 async function executeRun({
@@ -917,25 +948,7 @@ async function executeRun({
       timeoutMs: settings.timeoutMs,
       onProgress
     });
-    settings.sandbox = {
-      ...picked.sandbox,
-      // The proxy keys the credential on the provider of the model that won,
-      // not on whichever candidate stood in during preflight.
-      provider: picked.provider,
-      samplingParams: picked.samplingParams ?? undefined
-    };
-    settings.sandboxLabel = describeSandbox(settings.sandbox);
-    settings.model = settings.model ?? picked.model;
-    settings.provider = settings.provider ?? picked.provider;
-    // The model record's thinking overrides the preset's — that is how
-    // `*-local` (thinking off) and `*-zai` (low) collapse into one preset. A
-    // command-line flag still outranks both, hence the source check.
-    if (picked.thinking != null && !settings.thinkingFromFlag) {
-      settings.thinking = picked.thinking;
-    }
-    if (picked.tags?.length || settings.tags?.length) {
-      settings.tags = [...(settings.tags ?? []), ...(picked.tags ?? [])];
-    }
+    applyPickedVariant(settings, picked);
   }
 
   const job = createJobRecord({
