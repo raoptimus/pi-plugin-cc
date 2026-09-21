@@ -65,8 +65,8 @@ import {
   clearAllPools,
   clearPool,
   deadPools,
+  loadPoolHealthState,
   partitionByPoolHealth,
-  readPoolHealth,
   recordPoolFailure
 } from "./lib/pool-health.mjs";
 import { runPiRpcTurn } from "./lib/rpc.mjs";
@@ -970,7 +970,7 @@ export function applyPickedVariant(settings, picked) {
  *          race, in their original priority order (or deadline order when all
  *          are dead), plus the line to print when nothing was skipped silently
  */
-export function selectLiveVariants(variants, { cooldowns = null, now = Date.now() } = {}) {
+export function selectLiveVariants(variants, { now = Date.now() } = {}) {
   const { alive, dead, deadByPool } = partitionByPoolHealth(variants, { now });
   if (!dead.length) {
     return { variants, message: null };
@@ -1075,7 +1075,7 @@ async function executeRun({
     stderr: Boolean(flags.background)
   });
   if (settings.sandboxVariants?.length) {
-    const live = selectLiveVariants(settings.sandboxVariants, { cooldowns: settings.poolCooldowns });
+    const live = selectLiveVariants(settings.sandboxVariants);
     if (live.message) {
       onProgress({ phase: "starting", message: live.message });
     }
@@ -2303,12 +2303,20 @@ async function commandPools(argv, workspaceRoot) {
     );
   }
 
-  const pools = readPoolHealth();
+  const { pools, corrupted } = loadPoolHealthState();
   const names = Object.keys(pools).sort();
   if (flags.json) {
-    return output("", { pools }, true);
+    return output("", { pools, corrupted }, true);
   }
   if (!names.length) {
+    if (corrupted) {
+      return output(
+        "`pool-health.json` exists but cannot be parsed: until it is removed or repaired, " +
+          "every pool is treated as live — and whatever deaths were recorded here are lost.\n",
+        { pools, corrupted },
+        false
+      );
+    }
     return output("No pool liveness records: every known pool is considered live.\n", { pools }, false);
   }
   const lines = ["Pool liveness records:", ""];

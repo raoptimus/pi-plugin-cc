@@ -85,7 +85,7 @@ test("hold lengths follow the class: named quota window, otherwise the defaults"
 });
 
 test("a recorded failure puts the pool out of the choice until its deadline, then back in", async () => {
-  await await withIsolatedState(async () => {
+  await withIsolatedState(async () => {
     const now = Date.now();
     const record = recordPoolFailure("deepseek", "balance", '402 Insufficient Balance', { now, ...COOLDOWNS });
     assert.equal(record.class, "balance");
@@ -143,7 +143,7 @@ for (let i = 0; i < ${ROUNDS}; i++) {
 });
 
 test("consecutive failures accumulate the network hold; a cleared record starts over", async () => {
-  await await withIsolatedState(async () => {
+  await withIsolatedState(async () => {
     const now = Date.now();
     recordPoolFailure("vllm", "network", "ECONNREFUSED", { now, ...COOLDOWNS });
     const second = recordPoolFailure("vllm", "network", "ECONNREFUSED", { now, ...COOLDOWNS });
@@ -157,7 +157,7 @@ test("consecutive failures accumulate the network hold; a cleared record starts 
 });
 
 test("reset works per pool and wholesale", async () => {
-  await await withIsolatedState(async () => {
+  await withIsolatedState(async () => {
     const now = Date.now();
     recordPoolFailure("a", "quota", "429", { now, ...COOLDOWNS });
     recordPoolFailure("b", "network", "ETIMEDOUT", { now, ...COOLDOWNS });
@@ -171,7 +171,7 @@ test("reset works per pool and wholesale", async () => {
 
 test("the choice drops a dead pool outright and lists every pool when all are dead", async () => {
   const { selectLiveVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
-  await await withIsolatedState(async () => {
+  await withIsolatedState(async () => {
     const now = Date.now();
     // Two pools dead at different deadlines, one alive.
     recordPoolFailure("far", "balance", "402", { now: now - 1000, ...COOLDOWNS });
@@ -195,7 +195,7 @@ test("the choice drops a dead pool outright and lists every pool when all are de
 });
 
 test("partitioning reads the record, not the variant list shape", async () => {
-  await await withIsolatedState(async () => {
+  await withIsolatedState(async () => {
     const now = Date.now();
     recordPoolFailure("dead", "quota", "429", { now, ...COOLDOWNS });
     const { alive, dead, deadByPool } = partitionByPoolHealth([variant("dead"), variant("ok")], { now });
@@ -206,7 +206,7 @@ test("partitioning reads the record, not the variant list shape", async () => {
 });
 
 test("an expired record still prints in the state, but no longer skips anything", async () => {
-  await await withIsolatedState(async () => {
+  await withIsolatedState(async () => {
     const now = Date.now() - 4 * COOLDOWNS.networkMs;
     const record = recordPoolFailure("x", "network", "ETIMEDOUT", { now, ...COOLDOWNS });
     assert.ok(record.retryAtMs < Date.now(), "test needs an already-expired hold");
@@ -216,7 +216,7 @@ test("an expired record still prints in the state, but no longer skips anything"
 });
 
 test("a state file that cannot be read means nothing is dead, never a refusal", async () => {
-  await await withIsolatedState(async () => {
+  await withIsolatedState(async () => {
     fs.mkdirSync(path.dirname(poolHealthPath()), { recursive: true });
     fs.writeFileSync(poolHealthPath(), "{ not json");
     assert.deepEqual(deadPools(), {});
@@ -245,7 +245,7 @@ function twoPoolConfig({ pid }) {
 }
 
 test("dispatch skips a dead pool without paying poolWaitMs for the skip", async () => {
-  await await withIsolatedState(async () => {
+  await withIsolatedState(async () => {
     const { buildVariants, selectLiveVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
     const { awaitSandboxSlot, awaitVariantSlot } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
     const { normalizeConfigLayer } = await import("../plugins/pi/scripts/lib/config.mjs");
@@ -260,7 +260,7 @@ test("dispatch skips a dead pool without paying poolWaitMs for the skip", async 
     const held = await awaitSandboxSlot(variants[0].sandbox, { timeoutMs: 1000, pollMs: 10 });
     try {
       recordPoolFailure(deadPool, "balance", "402 Insufficient Balance", { ...COOLDOWNS });
-      const live = selectLiveVariants(variants, { cooldowns: COOLDOWNS });
+      const live = selectLiveVariants(variants);
       const startedAt = Date.now();
       const picked = await awaitVariantSlot(live.variants, { poolWaitMs: 5000, timeoutMs: 5000 });
       assert.ok(Date.now() - startedAt < 2000, `the skip must not cost the ${5000}ms threshold`);
@@ -319,9 +319,8 @@ test("settlePoolHealth: success erases, pool death records, task error leaves st
 });
 
 test("a preset of the old shape ignores pool liveness state entirely", async () => {
-  await await withIsolatedState(async () => {
+  await withIsolatedState(async () => {
     const { normalizeConfigLayer } = await import("../plugins/pi/scripts/lib/config.mjs");
-    const { resolveRunSettings } = await import("../plugins/pi/scripts/lib/config.mjs");
     const { selectLiveVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
     const config = normalizeConfigLayer(twoPoolConfig({ pid: `old-${process.pid}` }));
     recordPoolFailure(`alpha-old-${process.pid}`, "balance", "402", { ...COOLDOWNS });
@@ -330,8 +329,11 @@ test("a preset of the old shape ignores pool liveness state entirely", async () 
     const { buildVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
     const plan = buildVariants({ sandbox: "base" }, config);
     assert.deepEqual(plan.variants, []);
-    assert.equal(selectLiveVariants([], { cooldowns: COOLDOWNS }).variants.length, 0);
-    assert.ok(resolveRunSettings, "resolveRunSettings stays importable for the shape check");
+    assert.equal(selectLiveVariants([]).variants.length, 0);
+    // Behavior, not importability: the resolver still resolves — and refuses
+    // what it must refuse.
+    const { resolveRunSettings } = await import("../plugins/pi/scripts/lib/config.mjs");
+    assert.throws(() => resolveRunSettings({ presets: {} }, "run", { preset: "nope" }), /Unknown preset/);
   });
 });
 
@@ -343,6 +345,31 @@ test("the three cooldown fields merge field by field through the config layers",
   const merged = mergeConfigLayer(BUILT_IN_CONFIG, { poolCooldownNetworkMs: 5_000 });
   assert.equal(merged.poolCooldownNetworkMs, 5_000, "one field retuned, the others kept");
   assert.equal(merged.poolCooldownBalanceMs, 3_600_000);
+});
+
+test("the pools command tells a torn file apart from an empty one", async () => {
+  const { execFile: execFileCb } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const execFile = promisify(execFileCb);
+  const script = new URL("../plugins/pi/scripts/pi-companion.mjs", import.meta.url).pathname;
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "pools-torn-"));
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = dataDir;
+  try {
+    fs.mkdirSync(path.dirname(poolHealthPath()), { recursive: true });
+    fs.writeFileSync(poolHealthPath(), "{ half a record");
+    const listed = await execFile(process.execPath, [script, "pools"]);
+    assert.match(listed.stdout, /cannot be parsed/, "damage is shown, not papered over");
+    const asJson = JSON.parse((await execFile(process.execPath, [script, "pools", "--json"])).stdout);
+    assert.equal(asJson.corrupted, true);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
 });
 
 test("the pools command prints state and resets it by name and wholesale", async () => {

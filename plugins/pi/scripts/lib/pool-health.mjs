@@ -122,14 +122,31 @@ export function poolHealthPath() {
 }
 
 function readState() {
+  return { pools: loadPoolHealthState().pools };
+}
+
+/**
+ * Read the file with a verdict: `corrupted` separates "nothing has died yet"
+ * from "the file exists but cannot be parsed". Both behave the same on the
+ * dispatch path (fail-open), but the `pools` command exists to SHOW damage —
+ * it must not print a reassuring line over a torn file.
+ */
+export function loadPoolHealthState() {
+  let raw;
   try {
-    const parsed = JSON.parse(fs.readFileSync(poolHealthPath(), "utf8"));
-    return isPlainObject(parsed?.pools) ? parsed : { pools: {} };
+    raw = fs.readFileSync(poolHealthPath(), "utf8");
   } catch {
-    // A missing or half-written file means "nothing is known dead": liveness
-    // state must never be the reason a run refuses to start.
-    return { pools: {} };
+    return { pools: {}, corrupted: false };
   }
+  try {
+    const parsed = JSON.parse(raw);
+    if (isPlainObject(parsed?.pools)) {
+      return { pools: parsed.pools, corrupted: false };
+    }
+  } catch {
+    // Fall through to the corrupted verdict.
+  }
+  return { pools: {}, corrupted: true };
 }
 
 function writeState(state) {
@@ -240,5 +257,5 @@ export function partitionByPoolHealth(variants, { now = Date.now() } = {}) {
 }
 
 export function readPoolHealth() {
-  return readState().pools;
+  return loadPoolHealthState().pools;
 }
