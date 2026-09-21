@@ -1014,12 +1014,30 @@ export function settlePoolHealth(settings, execution, thrownError) {
     clearPool(pool);
     return null;
   }
-  const text = thrownError
-    ? thrownError instanceof Error
-      ? thrownError.message
-      : String(thrownError)
-    : (execution?.errors ?? []).join("\n");
-  const verdict = classifyPoolFailure(text);
+  // Classify per element, never over the joined text: both engines append the
+  // process's stderr tail as one trailing element, and a bare `429` or `fetch
+  // failed` in an unrelated stderr line must not cost a live pool its day —
+  // the owner runs this without a human in the loop. Only the provider channel
+  // (an engine event's `errorMessage`, or a thrown error) may evict a pool.
+  const channel = thrownError
+    ? [thrownError instanceof Error ? thrownError.message : String(thrownError)]
+    : [];
+  if (!thrownError) {
+    const stderrTail = typeof execution?.stderr === "string" ? execution.stderr.trim() : "";
+    for (const line of execution?.errors ?? []) {
+      if (stderrTail && line === stderrTail) {
+        continue;
+      }
+      channel.push(line);
+    }
+  }
+  let verdict = null;
+  for (const text of channel) {
+    verdict = classifyPoolFailure(text);
+    if (verdict) {
+      break;
+    }
+  }
   if (!verdict) {
     return null;
   }

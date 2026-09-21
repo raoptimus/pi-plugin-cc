@@ -292,6 +292,19 @@ test("settlePoolHealth: success erases, pool death records, task error leaves st
     settlePoolHealth(settings("zai"), { exitStatus: 1, errors: ['400 {"error":"unknown model"}'] }, null);
     assert.equal(deadPools().zai, undefined, "a 400 must not evict a live pool");
 
+    // The engines append the process stderr as one trailing element; a 429
+    // seen there is chatter of the local run, not the provider's verdict —
+    // it must not cost a live pool a day. The provider channel still does.
+    const stderrTail = "node:internal/process: 429 while printing the report\nfetch failed";
+    settlePoolHealth(
+      settings("kimi"),
+      { exitStatus: 1, errors: ['400 {"error":"bad request"}', stderrTail], stderr: stderrTail },
+      null
+    );
+    assert.equal(deadPools().kimi, undefined, "a 429 inside the stderr tail is not the provider speaking");
+    settlePoolHealth(settings("deepseek"), { exitStatus: 1, errors: ["429 Too Many Requests"] }, null);
+    assert.equal(deadPools().deepseek.class, "quota", "a real provider 429 still evicts");
+
     // No pool in play: nothing read, nothing written.
     const before = JSON.stringify(readPoolHealth());
     settlePoolHealth({ sandbox: { concurrencyGroup: "ghost" } }, { exitStatus: 1, errors: ["402"] }, null);
