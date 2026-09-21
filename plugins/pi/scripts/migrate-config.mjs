@@ -381,7 +381,10 @@ function buildFamily(role, members, priorities, serviceOf) {
   const sameForAll = (key) => presets.every((preset) => deepEqual(preset[key], presets[0][key]));
   const common = {};
   for (const key of Object.keys(presets[0])) {
-    if (key === "model" || key === "model2" || key === "sandbox" || key === "description" || key === "concurrencyGroup") {
+    // thinking не переносится «просто общим»: он разрешается глобально по всем
+    // пользователям модели (см. solveModelThinking) — иначе уровень одиночки
+    // затекает в модельную запись, построенную по чужому семейству.
+    if (key === "model" || key === "model2" || key === "sandbox" || key === "description" || key === "concurrencyGroup" || key === "thinking") {
       continue;
     }
     if (sameForAll(key)) {
@@ -390,10 +393,7 @@ function buildFamily(role, members, priorities, serviceOf) {
   }
 
   const modelOverrides = new Map();
-  const perModelKeys = ["thinking", "tags"].filter((key) => !sameForAll(key));
-  const shared = new Map(
-    perModelKeys.map((key) => [key, sameForAll(key) ? presets[0][key] : undefined])
-  );
+  const perModelKeys = ["tags"].filter((key) => !sameForAll(key));
   entries.forEach((member, index) => {
     const split = splitModel(member.preset.model);
     if (!split) {
@@ -403,7 +403,7 @@ function buildFamily(role, members, priorities, serviceOf) {
     const override = {};
     for (const field of perModelKeys) {
       const value = member.preset[field];
-      if (value === undefined || deepEqual(value, shared.get(field))) {
+      if (value === undefined) {
         continue;
       }
       if (field === "tags") {
@@ -420,6 +420,17 @@ function buildFamily(role, members, priorities, serviceOf) {
       modelOverrides.set(key, override);
     }
   });
+
+  // Требование роли к уровню thinking модели: у неоднообразного семейства —
+  // жёсткое (иначе различие членов не переживёт схлопывания), у однообразного
+  // — мягкое (уровень уже сидит на пресете, запись может его лишь повторять).
+  const uniformThinking = sameForAll("thinking") ? presets[0].thinking : undefined;
+  const thinkingDemands = new Map(
+    entries.map((member) => {
+      const split = splitModel(member.preset.model);
+      return [`${split.provider}/${split.name}`, { hard: uniformThinking === undefined, value: member.preset.thinking, name: member.name }];
+    })
+  );
 
   // Preference order: the pool's priority (smaller first); equal priorities
   // keep the listing the owner's example asks for — local vLLM last.
@@ -442,22 +453,107 @@ function buildFamily(role, members, priorities, serviceOf) {
       preset.description = description;
     }
   }
-  return { preset, modelOverrides, names };
+  return { preset, modelOverrides, names, role, uniformThinking, thinkingDemands };
 }
 
 /**
- * Apply the model-record overrides (thinking, tags) collected from families to
- * the registry records.
+ * Разрешает thinking модельных записей по требованиям ВСЕХ пользователей
+ * модели — членов семейств и одиночек. Запись одна на модель, а её thinking
+ * переопределяет пресетный, поэтому уровень с записи, построенной по одному
+ * семейству, затекал в одиночку с другим уровнем (researcher high получал low
+ * от flash-записи). Правило: запись получает уровень только когда все
+ * пользователи согласны; при конфликте запись остаётся чистой — семейство
+ * переносит свой уровень на пресет, одиночка сохраняет собственный.
  */
-function applyModelOverrides(pools, overrides) {
+function solveModelThinking(familyPlans, singles) {
+  const demands = new Map();
+  const add = (key, demand) => {
+    if (!demands.has(key)) {
+      demands.set(key, []);
+    }
+    demands.get(key).push(demand);
+  };
+  for (const plan of familyPlans) {
+    for (const [key, demand] of plan.thinkingDemands) {
+      add(key, { ...demand, role: plan.role });
+    }
+  }
+  for (const [name, preset] of singles) {
+    const split = splitModel(preset.model);
+    if (!split) {
+      continue;
+    }
+    add(`${split.provider}/${split.name}`, { hard: false, value: preset.thinking, name, role: name });
+  }
+
+  const resolved = new Map();
+  const familyFallbacks = new Map();
+  for (const [key, list] of demands) {
+    const hardValues = new Set(list.filter((demand) => demand.hard).map((demand) => demand.value));
+    if (hardValues.size > 1) {
+      const named = list.filter((demand) => demand.hard).map((demand) => `${demand.name} (${demand.value})`).join(", ");
+      throw new Error(
+        `Model "${key}" is demanded at different thinking levels by ${named} — ` +
+          "one model record cannot carry both; reconcile the roles by hand."
+      );
+    }
+    let value;
+    if (hardValues.size === 1) {
+      const [v] = hardValues;
+      value = list.every((demand) => demand.value === v) ? v : undefined;
+    } else {
+      const soft = list.map((demand) => demand.value);
+      value = soft.every((level) => level === soft[0]) ? soft[0] : undefined;
+    }
+    resolved.set(key, value);
+    if (value === undefined) {
+      for (const demand of list) {
+        if (!demand.hard) {
+          continue;
+        }
+        if (!familyFallbacks.has(demand.role)) {
+          familyFallbacks.set(demand.role, new Set());
+        }
+        familyFallbacks.get(demand.role).add(demand.value);
+      }
+    }
+  }
+
+  for (const plan of familyPlans) {
+    if (plan.uniformThinking !== undefined) {
+      plan.preset.thinking = plan.uniformThinking;
+      continue;
+    }
+    const required = familyFallbacks.get(plan.role);
+    if (!required) {
+      continue;
+    }
+    if (required.size > 1) {
+      throw new Error(
+        `Role "${plan.role}" members need different preset thinking (${[...required].join(", ")}) ` +
+          "after conflicting model records were kept clean — the role cannot collapse."
+      );
+    }
+    plan.preset.thinking = [...required][0];
+  }
+  return resolved;
+}
+
+/**
+ * Apply the model-record overrides (tags) and the globally solved thinking
+ * levels to the registry records.
+ */
+function applyModelOverrides(pools, overrides, thinkingById) {
   for (const pool of pools) {
     for (const model of pool.models) {
-      const extra = overrides.get(`${model.provider}/${model.name}`);
-      if (extra?.thinking !== undefined) {
-        model.thinking = extra.thinking;
-      }
+      const key = `${model.provider}/${model.name}`;
+      const extra = overrides.get(key);
       if (extra?.tags !== undefined) {
         model.tags = extra.tags;
+      }
+      const thinking = thinkingById.get(key);
+      if (thinking !== undefined) {
+        model.thinking = thinking;
       }
     }
   }
@@ -535,14 +631,19 @@ export function migrateConfig(raw) {
   }
   const presetsOut = [];
   const overrides = new Map();
+  const familyPlans = [];
   for (const [role, members] of families) {
-    const { preset, modelOverrides } = buildFamily(role, members, priorities, serviceOf);
-    presetsOut.push(preset);
-    for (const [key, value] of modelOverrides) {
+    const plan = buildFamily(role, members, priorities, serviceOf);
+    familyPlans.push(plan);
+    for (const [key, value] of plan.modelOverrides) {
       overrides.set(key, value);
     }
   }
-  applyModelOverrides(poolsOut, overrides);
+  const thinkingById = solveModelThinking(familyPlans, singles);
+  for (const plan of familyPlans) {
+    presetsOut.push(plan.preset);
+  }
+  applyModelOverrides(poolsOut, overrides, thinkingById);
 
   for (const [name, preset] of singles) {
     presetsOut.push(carrySingle(name, preset, serviceOf, poolNames));

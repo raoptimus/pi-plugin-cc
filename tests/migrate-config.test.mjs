@@ -34,7 +34,7 @@ function liveFleet() {
   });
   const family = (role, zaiProfile, qa = false) => ({
     [`${role}-zai`]: member("zai-coding-cn/glm-5.3-flash", "low", sb(role, zaiProfile, qa), { description: `${role} (zai)` }),
-    [`${role}-deepseek`]: member("deepseek/deepseek-v4-flash", "off", sb(role, "agent-deepseek", qa), { description: `${role} (deepseek)` }),
+    [`${role}-deepseek`]: member("deepseek/deepseek-v4-flash", "low", sb(role, "agent-deepseek", qa), { description: `${role} (deepseek)` }),
     [`${role}-local`]: member("vllm/Qwen3.8-27B", "off", sb(role, "agent-dind-vllm", qa), { description: `${role} (local)` })
   });
   const dind = { args: ["--security-opt", "seccomp=@dind.json", "--device", "/dev/net/tun"], env: ["PI_DIND=1"], mounts: ["pi-dind:/var/lib/docker"] };
@@ -70,8 +70,8 @@ function liveFleet() {
         systemPrompt: "reviewer",
         description: "Ревьюер"
       },
-      researcher: { model: "zai-coding-cn/glm-5.3-flash", thinking: "low", sandbox: sb("researcher", "agent"), systemPrompt: "@research" },
-      "coverage-auditor": { model: "deepseek/deepseek-v4-flash", thinking: "off", sandbox: sb("coverage-auditor", "agent-deepseek"), systemPrompt: "@coverage" },
+      researcher: { model: "zai-coding-cn/glm-5.3-flash", thinking: "high", sandbox: sb("researcher", "agent"), systemPrompt: "@research" },
+      "coverage-auditor": { model: "deepseek/deepseek-v4-flash", thinking: "high", sandbox: sb("coverage-auditor", "agent-deepseek"), systemPrompt: "@coverage" },
     },
     gitProxy: { "github.com": {} }
   };
@@ -97,13 +97,16 @@ test("Т-2: семейство схлопывается в один пресет
   assert.equal(go.sandbox.profile, "agent");
   assert.equal(go.systemPrompt, "@dev");
   assert.deepEqual(go.tags, ["fleet"]);
-  // Различавшиеся thinking — на записях моделей.
+  // Различавшиеся thinking — на записях моделей. С решателем по всем
+  // пользователям модели: flash нужна семействам на low, researcher — на high;
+  // конфликт не кладётся на запись — семейство переносит low на пресет.
   const poolModels = Object.fromEntries(
     config.concurrencyPools.flatMap((pool) => pool.models.map((model) => [model.id, model]))
   );
-  assert.equal(poolModels["zai-glm-5.3-flash"].thinking, "low");
-  assert.equal(poolModels["deepseek-deepseek-v4-flash"].thinking, "off");
+  assert.equal(poolModels["zai-glm-5.3-flash"].thinking, undefined, "conflicting demand must not land on the record");
+  assert.equal(poolModels["deepseek-deepseek-v4-flash"].thinking, undefined);
   assert.equal(poolModels["vllm-Qwen3.8-27B"].thinking, "off");
+  assert.equal(go.thinking, "low", "family carries the level its members demanded");
   // Одиночки переносятся как есть.
   const reviewer = config.presets.find((preset) => preset.id === "reviewer");
   assert.deepEqual(reviewer.models, ["zai-glm-5.3"]);
@@ -294,6 +297,24 @@ test("фикс: группа слотов каждого старого имен
 });
 
 // Фикс-раунд 2: собственный env роли из объектной песочницы.
+
+// Фикс-раунд 2: thinking одиночек не затекает из модельной записи.
+
+test("фикс-раунд 2: thinking одиночки берётся из него самого, конфликт записи решается в пользу роли", () => {
+  const raw = liveFleet();
+  const { config } = migrateConfig(raw);
+  assert.deepEqual(verifyEquivalence(raw, config), []);
+  const researcher = config.presets.find((preset) => preset.id === "researcher");
+  assert.equal(researcher.thinking, "high", "researcher keeps its own level, not the family-built record's low");
+  const coverage = config.presets.find((preset) => preset.id === "coverage-auditor");
+  assert.equal(coverage.thinking, "high");
+  // Уровень, где различие было настоящим и бесспорным (vllm off у всех), — на записи.
+  const vllm = config.concurrencyPools.flatMap((pool) => pool.models).find((model) => model.id === "vllm-Qwen3.8-27B");
+  assert.equal(vllm.thinking, "off");
+  // Однозначная модельная запись (glm-5.3 — только reviewer) несёт свой уровень.
+  const glm = config.concurrencyPools.flatMap((pool) => pool.models).find((model) => model.id === "zai-glm-5.3");
+  assert.equal(glm.thinking, "high");
+});
 
 test("фикс-раунд 2: env роли переезжает на пресет новой формы, у qa — свой test-only-guard", () => {
   const raw = liveFleet();
