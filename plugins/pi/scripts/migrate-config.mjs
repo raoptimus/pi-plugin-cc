@@ -1,0 +1,680 @@
+#!/usr/bin/env node
+/**
+ * Migration: the historical per-provider preset fleet (20 presets on 11 roles,
+ * five sandbox profiles, `concurrencyPools` as bare slot numbers) into the
+ * owner form — one preset per role with a `models` list, a model registry with
+ * globally unique ids, sandbox services with `extend`, pools with
+ * `limit`/`priority`/`aliases`.
+ *
+ * The script NEVER writes to its input. It reads the old config, builds the
+ * new one, PROVES equivalence (T-6: for every old preset name the resolved
+ * model, provider, thinking, prompts, tools, mounts, skills, env, timeout, git
+ * identity and the sandbox contour must be identical), prints the new config
+ * and a diff. Only `--out <file>` — a path distinct from the input — writes
+ * anything, and only after equivalence holds. The owner applies the diff.
+ *
+ * Usage:
+ *   node migrate-config.mjs <old-config.json> [--out <new-config.json>] [--no-diff]
+ *
+ * Exit codes: 0 — equivalent, diff shown; 1 — equivalence refused (the list
+ * of mismatches is printed) or a structural error; 2 — usage error.
+ */
+
+import fs from "node:fs";
+import path from "node:path";
+
+import {
+  concatAdditive,
+  normalizeConfigLayer,
+  resolvePresetReference,
+  resolveRunSettings
+} from "./lib/config.mjs";
+import { normalizeSandbox } from "./lib/sandbox.mjs";
+import { buildVariants } from "./pi-companion.mjs";
+
+/** Provider suffixes a historical preset name could end with, mapped to pools. */
+const POOL_ALIASES = { local: "vllm" };
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function deepEqual(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/** The provider half of a historical `provider/model` string, or null. */
+function splitModel(model) {
+  if (typeof model !== "string" || !model.includes("/")) {
+    return null;
+  }
+  const at = model.indexOf("/");
+  return { provider: model.slice(0, at), name: model.slice(at + 1) };
+}
+
+/**
+ * Which pool a provider belongs to. Pool names are short and live inside the
+ * provider string (`zai` ⊂ `zai-coding-cn`, `vllm` ⊂ `vllm`); longest match
+ * wins so a hypothetical `zai2` pool would not be swallowed by `zai`.
+ */
+function poolOfProvider(provider, poolNames) {
+  const matches = [...poolNames].filter((pool) => provider === pool || provider.includes(pool));
+  if (!matches.length) {
+    return null;
+  }
+  return matches.sort((a, b) => b.length - a.length)[0];
+}
+
+/** Global model id: `<pool>-<name>`, per the owner form. */
+function modelId(pool, name) {
+  return `${pool}-${name}`;
+}
+
+/** Longest common prefix at a word boundary — for folding family descriptions. */
+function commonDescription(descriptions) {
+  if (!descriptions.length) {
+    return undefined;
+  }
+  let prefix = descriptions[0];
+  for (const text of descriptions.slice(1)) {
+    let at = 0;
+    while (at < prefix.length && at < text.length && prefix[at] === text[at]) {
+      at += 1;
+    }
+    prefix = prefix.slice(0, at);
+  }
+  const cut = prefix.lastIndexOf(" ");
+  return (cut > 0 ? prefix.slice(0, cut) : prefix).trimEnd();
+}
+
+/**
+ * Read the historical config into its normalized shape: presets, profiles
+ * (`extend` already read as `profile`) and pools as objects.
+ */
+function loadOldConfig(raw) {
+  const config = normalizeConfigLayer(raw);
+  if (!isPlainObject(config.presets) || !Object.keys(config.presets).length) {
+    throw new Error("No presets found in the config — nothing to migrate.");
+  }
+  return config;
+}
+
+/**
+ * Group historical presets into roles.
+ *
+ * A preset whose name ends in `-<pool>` (or `-<alias>` — the fleet says
+ * `*-local`, the pool is `vllm`) is a family member of `<role>`; the rest are
+ * singles carried as they are. Returns `{ families: Map<role, Map<pool, {name,
+ * preset}>>, singles: Map<name, preset> }`.
+ */
+function groupByRole(presets, pools) {
+  const families = new Map();
+  const singles = new Map();
+  for (const [name, preset] of Object.entries(presets)) {
+    let matched = null;
+    for (const tail of [...Object.keys(pools), ...Object.keys(POOL_ALIASES)]) {
+      if (name.endsWith(`-${tail}`)) {
+        matched = { role: name.slice(0, -(tail.length + 1)), pool: POOL_ALIASES[tail] ?? tail };
+        break;
+      }
+    }
+    if (!matched || !matched.role) {
+      singles.set(name, preset);
+      continue;
+    }
+    if (!families.has(matched.role)) {
+      families.set(matched.role, new Map());
+    }
+    const members = families.get(matched.role);
+    if (members.has(matched.pool)) {
+      throw new Error(`Two presets resolve to role "${matched.role}" pool "${matched.pool}": "${members.get(matched.pool).name}" and "${name}".`);
+    }
+    members.set(matched.pool, { name, preset });
+  }
+  return { families, singles };
+}
+
+/**
+ * Build the model registry: one record per distinct `provider/name` the fleet
+ * uses, sitting in the pool its provider belongs to.
+ *
+ * `thinking` and `tags` are filled in later by the families whose members
+ * differed on them — that is the difference that would not survive collapsing
+ * unless it moved onto the model record.
+ */
+function buildPools(config, poolOrder) {
+  const presets = { ...config.presets };
+  const used = new Map(); // `${provider}/${name}` → {provider, name, pools:Set}
+  for (const preset of Object.values(presets)) {
+    // `model2` is deliberately absent: it is a rudiment nothing reads, and a
+    // rudiment must not seed a registry record (T-7).
+    for (const model of [preset.model]) {
+      const split = splitModel(model);
+      if (!split) {
+        continue;
+      }
+      const key = `${split.provider}/${split.name}`;
+      if (!used.has(key)) {
+        used.set(key, { ...split, pools: new Set() });
+      }
+    }
+  }
+  for (const entry of used.values()) {
+    for (const pool of poolOrder) {
+      if (poolOfProvider(entry.provider, [pool]) === pool) {
+        entry.pools.add(pool);
+      }
+    }
+    if (!entry.pools.size) {
+      throw new Error(`Model "${entry.provider}/${entry.name}" matches none of the configured pools.`);
+    }
+  }
+
+  const poolsOut = poolOrder.map((pool) => {
+    const old = isPlainObject(config.concurrencyPools?.[pool]) ? config.concurrencyPools[pool] : { limit: config.concurrencyPools?.[pool] };
+    const limit = Number(old?.limit);
+    if (!Number.isFinite(limit) || limit <= 0) {
+      throw new Error(`Pool "${pool}" has no usable slot limit; the new form requires one.`);
+    }
+    const models = [...used.values()]
+      .filter((entry) => entry.pools.has(pool))
+      .map((entry) => ({ id: modelId(pool, entry.name), provider: entry.provider, name: entry.name }));
+    return {
+      pool,
+      limit,
+      // The owner's example keeps every pool at the same priority and orders
+      // candidates by the preset's model list; the number stays configurable.
+      priority: Number.isFinite(Number(old?.priority)) ? Number(old.priority) : 10,
+      ...(pool === "vllm" ? { aliases: ["local"] } : {}),
+      models
+    };
+  });
+  return { poolsOut, used };
+}
+
+/**
+ * Resolve each historical profile to its full content (inheritance folded in),
+ * minus `concurrencyGroup` — the provider dimension the new form removes.
+ */
+function resolvedProfiles(config) {
+  const resolved = new Map();
+  for (const [name, profile] of Object.entries(config.sandboxProfiles ?? {})) {
+    const full = normalizeSandbox(name, config.sandboxProfiles ?? {});
+    delete full.concurrencyGroup;
+    delete full.maxConcurrent;
+    delete full.profileName;
+    resolved.set(name, full);
+  }
+  return resolved;
+}
+
+/**
+ * Collapse the profiles into the minimal service set.
+ *
+ * Profiles with identical resolved content share one service; a service whose
+ * content is a superset of the base's is written as `extend: base` plus the
+ * delta, otherwise standalone (additive `extend` cannot express a smaller
+ * list). The base is the profile other profiles inherit from, named `-base`
+ * by convention; its own name is kept.
+ */
+function buildServices(config) {
+  const resolved = resolvedProfiles(config);
+  const names = [...resolved.keys()];
+  if (!names.length) {
+    return { services: [], serviceOf: new Map() };
+  }
+  const baseName = names.find((name) => name.endsWith("-base")) ?? names[0];
+  const base = resolved.get(baseName);
+
+  const groups = new Map(); // JSON of resolved content → representative name
+  for (const [name, content] of resolved) {
+    const key = JSON.stringify(content);
+    if (!groups.has(key)) {
+      groups.set(key, []);
+    }
+    groups.get(key).push(name);
+  }
+
+  const services = [];
+  const serviceOf = new Map();
+  for (const [, members] of groups) {
+    // Shortest member name reads best as a service id (`agent`, not `agent-dind-vllm`).
+    const canonical = [...members].sort((a, b) => a.length - b.length || (a === baseName ? -1 : b === baseName ? 1 : 0))[0];
+    const content = resolved.get(canonical);
+    if (canonical === baseName) {
+      // The base is written as the owner wrote it, not as the defaults-filled
+      // resolved blob: `normalizeSandbox` folds SANDBOX_DEFAULTS in, and the
+      // owner form should name only what the fleet itself chose.
+      const { profile, concurrencyGroup, maxConcurrent, ...own } = isPlainObject(config.sandboxProfiles?.[canonical])
+        ? config.sandboxProfiles[canonical]
+        : { ...content };
+      services.push({ id: canonical, ...own });
+      for (const member of members) {
+        serviceOf.set(member, canonical);
+      }
+      continue;
+    }
+    const delta = {};
+    for (const [key, value] of Object.entries(content)) {
+      if (key === "profile") {
+        continue;
+      }
+      if (Array.isArray(value)) {
+        const inherited = Array.isArray(base[key]) ? base[key] : [];
+        const extra = value.filter((entry) => !inherited.some((item) => deepEqual(item, entry)));
+        if (extra.length) {
+          delta[key] = extra;
+        }
+        continue;
+      }
+      if (!deepEqual(base[key], value)) {
+        delta[key] = value;
+      }
+    }
+    const subsumed = Object.entries(base).every(([key, value]) =>
+      Array.isArray(value) ? true : deepEqual(content[key] ?? value, value)
+    );
+    services.push(subsumed ? { id: canonical, extend: baseName, ...delta } : { id: canonical, ...content });
+    for (const member of members) {
+      serviceOf.set(member, canonical);
+    }
+  }
+  return { services, serviceOf };
+}
+
+/**
+ * Fold a family into one role preset.
+ *
+ * Fields all members share carry over once; `thinking` and `tags` that
+ * differed go onto the model records; `description` folds to the common
+ * prefix. Returns `{ preset, modelOverrides: Map<modelKey, {thinking?, tags?}>
+ * }`.
+ */
+function buildFamily(role, members, priorities, serviceOf) {
+  const entries = [...members.values()];
+  const names = entries.map((member) => member.name);
+  const presets = entries.map((member) => member.preset);
+
+  const services = new Set(entries.map((member) => serviceOf.get(String(member.preset.sandbox ?? ""))));
+  if (services.size > 1 || [...services][0] === undefined) {
+    throw new Error(
+      `Role "${role}" spans sandbox profiles that do not collapse into one service (${names.join(", ")}). ` +
+        "Equivalence could not hold for every old name; the profiles must be reconciled by hand."
+    );
+  }
+
+  const sameForAll = (key) => presets.every((preset) => deepEqual(preset[key], presets[0][key]));
+  const common = {};
+  for (const key of Object.keys(presets[0])) {
+    if (key === "model" || key === "model2" || key === "sandbox" || key === "description") {
+      continue;
+    }
+    if (sameForAll(key)) {
+      common[key] = presets[0][key];
+    }
+  }
+
+  const modelOverrides = new Map();
+  const perModelKeys = ["thinking", "tags"].filter((key) => !sameForAll(key));
+  const shared = new Map(
+    perModelKeys.map((key) => [key, sameForAll(key) ? presets[0][key] : undefined])
+  );
+  entries.forEach((member, index) => {
+    const split = splitModel(member.preset.model);
+    if (!split) {
+      throw new Error(`Preset "${member.name}" has no usable "provider/model" string.`);
+    }
+    const key = `${split.provider}/${split.name}`;
+    const override = {};
+    for (const field of perModelKeys) {
+      const value = member.preset[field];
+      if (value === undefined || deepEqual(value, shared.get(field))) {
+        continue;
+      }
+      if (field === "tags") {
+        const presetTags = Array.isArray(common.tags) ? common.tags : [];
+        const extra = value.filter((tag) => !presetTags.includes(tag));
+        if (extra.length) {
+          override.tags = extra;
+        }
+      } else {
+        override[field] = value;
+      }
+    }
+    if (Object.keys(override).length) {
+      modelOverrides.set(key, override);
+    }
+  });
+
+  // Preference order: the pool's priority (smaller first); equal priorities
+  // keep the listing the owner's example asks for — local vLLM last.
+  const poolRank = new Map(
+    [...priorities.keys()].sort((a, b) => Number(a === "vllm") - Number(b === "vllm")).map((pool, index) => [pool, index])
+  );
+  const ordered = [...members.entries()].sort(
+    (a, b) => (priorities.get(a[0]) ?? 0) - (priorities.get(b[0]) ?? 0) || (poolRank.get(a[0]) ?? 0) - (poolRank.get(b[0]) ?? 0)
+  );
+
+  const preset = {
+    id: role,
+    models: ordered.map(([pool, member]) => modelId(pool, splitModel(member.preset.model).name)),
+    sandboxService: serviceOf.get(String(entries[0].preset.sandbox)),
+    ...common
+  };
+  if (presets.some((preset) => preset.description !== undefined)) {
+    const description = commonDescription(presets.map((preset) => preset.description ?? ""));
+    if (description) {
+      preset.description = description;
+    }
+  }
+  return { preset, modelOverrides, names };
+}
+
+/**
+ * Apply the model-record overrides (thinking, tags) collected from families to
+ * the registry records.
+ */
+function applyModelOverrides(pools, overrides) {
+  for (const pool of pools) {
+    for (const model of pool.models) {
+      const extra = overrides.get(`${model.provider}/${model.name}`);
+      if (extra?.thinking !== undefined) {
+        model.thinking = extra.thinking;
+      }
+      if (extra?.tags !== undefined) {
+        model.tags = extra.tags;
+      }
+    }
+  }
+}
+
+/** Carry a single (non-family) preset over, translated to the owner form. */
+function carrySingle(name, preset, serviceOf, poolNames) {
+  const carried = { id: name };
+  const split = splitModel(preset.model);
+  if (split) {
+    const pool = poolOfProvider(split.provider, poolNames);
+    if (!pool) {
+      throw new Error(`Single preset "${name}": model "${preset.model}" matches no pool.`);
+    }
+    carried.models = [modelId(pool, split.name)];
+  }
+  if (preset.sandbox !== undefined) {
+    const service = serviceOf.get(String(preset.sandbox));
+    if (!service) {
+      throw new Error(`Single preset "${name}": sandbox profile "${preset.sandbox}" is not defined.`);
+    }
+    carried.sandboxService = service;
+  }
+  for (const [key, value] of Object.entries(preset)) {
+    if (key === "model" || key === "sandbox") {
+      continue;
+    }
+    carried[key] = value;
+  }
+  return carried;
+}
+
+/**
+ * Migrate the old config into the owner form. Returns
+ * `{ config, dropped, serviceOf }`; `config` is the plain JSON-serializable
+ * object with the three blocks as arrays.
+ */
+export function migrateConfig(raw) {
+  const config = loadOldConfig(raw);
+  const poolNames = Object.keys(config.concurrencyPools ?? {});
+  const poolOrder = [...poolNames].sort((a, b) => (a === "vllm" ? 1 : 0) - (b === "vllm" ? 1 : 0));
+
+  const { families, singles } = groupByRole(config.presets, config.concurrencyPools ?? {});
+  const { services, serviceOf } = buildServices(config);
+  const { poolsOut } = buildPools(config, poolOrder);
+  const priorities = new Map(poolsOut.map((pool) => [pool.pool, pool.priority]));
+
+  const dropped = [];
+  // Named, not silently dropped: the field is read by nothing today, but the
+  // owner has to see it disappear from their fleet's config (T-7).
+  for (const [name, preset] of Object.entries(config.presets)) {
+    if (preset.model2 !== undefined) {
+      dropped.push(`presets.${name}.model2 (= ${JSON.stringify(preset.model2)}) — не читается ничем, снят`);
+    }
+  }
+  const presetsOut = [];
+  const overrides = new Map();
+  for (const [role, members] of families) {
+    const { preset, modelOverrides } = buildFamily(role, members, priorities, serviceOf);
+    presetsOut.push(preset);
+    for (const [key, value] of modelOverrides) {
+      overrides.set(key, value);
+    }
+  }
+  applyModelOverrides(poolsOut, overrides);
+
+  for (const [name, preset] of singles) {
+    presetsOut.push(carrySingle(name, preset, serviceOf, poolNames));
+  }
+
+  const newConfig = { ...raw };
+  delete newConfig.concurrencyPools;
+  delete newConfig.sandboxProfiles;
+  delete newConfig.presets;
+  newConfig.sandboxServices = services;
+  newConfig.concurrencyPools = poolsOut;
+  newConfig.presets = presetsOut;
+
+  return { config: newConfig, dropped, serviceOf };
+}
+
+/**
+ * Equivalence proof (T-6). For every historical preset name, resolve it in the
+ * NEW config (through the pool alias — `*-local` pins `vllm`) and compare what
+ * a run would actually get against the old config's answer.
+ *
+ * Returns a list of mismatch descriptions; empty means equivalent.
+ */
+export function verifyEquivalence(oldRaw, newRaw) {
+  const old = normalizeConfigLayer(oldRaw);
+  const fresh = normalizeConfigLayer(JSON.parse(JSON.stringify(newRaw)));
+  const problems = [];
+
+  for (const name of Object.keys(old.presets ?? {})) {
+    const reference = resolvePresetReference(fresh, name);
+    if (!reference) {
+      problems.push(`${name}: имя больше не разрешается в новой конфигурации (ни пресет, ни алиас пула).`);
+      continue;
+    }
+    const oldSettings = resolveRunSettings(old, "delegate", { preset: name });
+    const newSettings = resolveRunSettings(fresh, "delegate", { preset: name });
+    const { variants } = buildVariants(reference.preset, fresh, { poolPin: reference.poolPin });
+    if (!variants.length) {
+      problems.push(`${name}: пресет "${reference.presetName}" не содержит моделей.`);
+      continue;
+    }
+    const variant = variants[0];
+
+    const check = (field, oldValue, newValue) => {
+      if (!deepEqual(oldValue, newValue)) {
+        problems.push(
+          `${name}: ${field} расходится — старая ${JSON.stringify(oldValue)}, новая ${JSON.stringify(newValue)}.`
+        );
+      }
+    };
+
+    check("model", oldSettings.model, variant.model);
+    // The historical preset carries `provider/model` as one string and the
+    // provider is read off its prefix at run time; the new form resolves the
+    // same pair from the model record.
+    const oldProvider = splitModel(old.presets[name]?.model)?.provider ?? oldSettings.provider;
+    check("provider", oldProvider, variant.provider);
+    check(
+      "thinking",
+      oldSettings.thinking,
+      variant.thinking ?? newSettings.thinking
+    );
+    const tagsOf = (value) => [...(Array.isArray(value) ? value : [])].sort();
+    check("tags", tagsOf(oldSettings.tags), tagsOf([...(newSettings.tags ?? []), ...variant.tags]));
+    for (const field of [
+      "systemPrompt",
+      "appendSystemPrompt",
+      "tools",
+      "excludeTools",
+      "readOnly",
+      "extensions",
+      "skills",
+      "mounts",
+      "git",
+      "budget",
+      "engine",
+      "timeoutMs"
+    ]) {
+      check(field, oldSettings[field], newSettings[field]);
+    }
+    if (!deepEqual(old.presets[name]?.env ?? null, fresh.presets?.[reference.presetName]?.env ?? null)) {
+      check("env", old.presets[name]?.env ?? null, fresh.presets?.[reference.presetName]?.env ?? null);
+    }
+
+    const contour = (config, sandbox) => {
+      if (sandbox == null) {
+        return null;
+      }
+      const full = normalizeSandbox(sandbox, config.sandboxProfiles ?? {});
+      delete full.concurrencyGroup;
+      delete full.maxConcurrent;
+      delete full.profileName;
+      return full;
+    };
+    check("sandbox", contour(old, oldSettings.sandbox), contour(fresh, newSettings.sandbox));
+  }
+  return problems;
+}
+
+/** Minimal line diff (LCS) between two strings, unified-style. */
+export function lineDiff(before, after, labelBefore = "old", labelAfter = "new") {
+  const a = before.split("\n");
+  const b = after.split("\n");
+  const n = a.length;
+  const m = b.length;
+  const lcs = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      lcs[i][j] = a[i] === b[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+    }
+  }
+  const lines = [`--- ${labelBefore}`, `+++ ${labelAfter}`];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      lines.push(`  ${a[i]}`);
+      i += 1;
+      j += 1;
+    } else if (lcs[i + 1][j] >= lcs[i][j + 1]) {
+      lines.push(`- ${a[i]}`);
+      i += 1;
+    } else {
+      lines.push(`+ ${b[j]}`);
+      j += 1;
+    }
+  }
+  while (i < n) {
+    lines.push(`- ${a[i]}`);
+    i += 1;
+  }
+  while (j < m) {
+    lines.push(`+ ${b[j]}`);
+    j += 1;
+  }
+  return lines.join("\n");
+}
+
+function usage() {
+  return "usage: migrate-config.mjs <old-config.json> [--out <new-config.json>] [--no-diff]\n";
+}
+
+export async function main(argv) {
+  const noDiff = argv.includes("--no-diff");
+  const outIndex = argv.indexOf("--out");
+  let outPath = null;
+  if (outIndex !== -1) {
+    outPath = argv[outIndex + 1];
+    if (!outPath || outPath.startsWith("--")) {
+      process.stderr.write("--out needs a file path.\n");
+      return 2;
+    }
+  }
+  const inputPath = argv
+    .filter((token, index) => outIndex === -1 || (index !== outIndex && index !== outIndex + 1))
+    .find((token) => !token.startsWith("--"));
+  if (!inputPath) {
+    process.stderr.write(usage());
+    return 2;
+  }
+
+  let raw;
+  try {
+    raw = JSON.parse(fs.readFileSync(inputPath, "utf8"));
+  } catch (error) {
+    process.stderr.write(`Cannot read ${inputPath}: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+
+  const inputReal = path.resolve(inputPath);
+  if (outPath && path.resolve(outPath) === inputReal) {
+    process.stderr.write(
+      `Refusing to write ${outPath}: the migration never overwrites its input. Name a different file.\n`
+    );
+    return 2;
+  }
+
+  let migrated;
+  try {
+    migrated = migrateConfig(raw);
+  } catch (error) {
+    process.stderr.write(`Migration refused: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+
+  const problems = verifyEquivalence(raw, migrated.config);
+  if (problems.length) {
+    process.stderr.write(
+      `Equivalence FAILED for ${problems.length} check(s); nothing was written:\n` +
+        problems.map((line) => `  - ${line}`).join("\n") +
+        "\n"
+    );
+    return 1;
+  }
+
+  const oldText = JSON.stringify(raw, null, 2) + "\n";
+  const newText = JSON.stringify(migrated.config, null, 2) + "\n";
+
+  if (outPath) {
+    if (path.resolve(outPath) === inputReal) {
+      process.stderr.write("Refusing to write over the input.\n");
+      return 2;
+    }
+    fs.writeFileSync(outPath, newText);
+    process.stdout.write(`New configuration written to ${outPath}\n\n`);
+  }
+  if (migrated.dropped.length) {
+    process.stdout.write(
+      `Removed rudiments:\n${migrated.dropped.map((line) => `  - ${line}`).join("\n")}\n\n`
+    );
+  }
+  if (!noDiff) {
+    process.stdout.write(lineDiff(oldText, newText, `${inputPath} (old)`, outPath ?? "<new config>") + "\n");
+  } else {
+    process.stdout.write(newText);
+  }
+  return 0;
+}
+
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(new URL(import.meta.url).pathname)) {
+  main(process.argv.slice(2)).then(
+    (code) => {
+      process.exitCode = code ?? 0;
+    },
+    (error) => {
+      process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+      process.exitCode = 1;
+    }
+  );
+}
