@@ -1291,6 +1291,13 @@ export function sandboxDockerfile(name = "base", { workspaceRoot = null } = {}) 
 /**
  * Every image the config knows about: the base one plus whatever profiles name.
  * A profile that names an `image` but no `dockerfile` is built from the base.
+ *
+ * The image is read off the RESOLVED profile, not off its own fields: a profile
+ * that inherits (`extend`/`profile`) states neither image nor dockerfile, and
+ * reading the raw entry filed it under the base image — so `sandbox build
+ * <role>` rebuilt a different image than the role actually runs on, and
+ * `sandbox status` listed it under the wrong tag. Invisible while the owner
+ * form repeated `image` on every profile; the roles form states it once.
  */
 export function listSandboxImages(config = {}) {
   // Keyed by image tag, because that is what a build produces: profiles sharing
@@ -1299,7 +1306,17 @@ export function listSandboxImages(config = {}) {
     [DEFAULT_SANDBOX_IMAGE, { name: "base", image: DEFAULT_SANDBOX_IMAGE, dockerfile: "base", profiles: [] }]
   ]);
 
-  for (const [name, profile] of Object.entries(config.sandboxProfiles ?? {})) {
+  const profiles = config.sandboxProfiles ?? {};
+  for (const [name, entry] of Object.entries(profiles)) {
+    // A profile too broken to resolve (a cycle, an unknown parent) keeps its own
+    // fields here: the inventory reports what it can, and the run that uses the
+    // profile is where the refusal belongs.
+    let profile = entry;
+    try {
+      profile = normalizeSandbox(name, profiles);
+    } catch {
+      profile = entry;
+    }
     const image = profile?.image ?? DEFAULT_SANDBOX_IMAGE;
     const existing = images.get(image);
     if (existing) {
