@@ -928,6 +928,40 @@ function usage() {
   return "usage: migrate-config.mjs <old-config.json> [--out <new-config.json>] [--no-diff]\n";
 }
 
+/**
+ * Личность файла, а не путь: `--out`, указанный на симлинк или хардлинк входа,
+ * разрешается в ТОТ ЖЕ inode, и сравнение `path.resolve` пропустило бы запись
+ * в живой конфиг. Для существующего файла — пара dev+ino (`fs.statSync`
+ * следует симлинкам, так что alias любого вида сходится на вход); для ещё не
+ * существующего `--out` — realpath его каталога плюс имя.
+ */
+function fileIdentity(filePath) {
+  try {
+    const stats = fs.statSync(filePath);
+    return { dev: stats.dev, ino: stats.ino };
+  } catch {
+    try {
+      return { dir: fs.realpathSync(path.dirname(filePath)), base: path.basename(filePath) };
+    } catch {
+      return { unresolved: path.resolve(filePath) };
+    }
+  }
+}
+
+function sameFile(a, b) {
+  if (a.dev !== undefined && b.dev !== undefined) {
+    return a.dev === b.dev && a.ino === b.ino;
+  }
+  if (a.dir !== undefined && b.dir !== undefined) {
+    return a.dir === b.dir && a.base === b.base;
+  }
+  return false;
+}
+
+function refusesOutputOverInput(inputPath, outPath) {
+  return sameFile(fileIdentity(inputPath), fileIdentity(outPath));
+}
+
 export async function main(argv) {
   const noDiff = argv.includes("--no-diff");
   const outIndex = argv.indexOf("--out");
@@ -955,8 +989,7 @@ export async function main(argv) {
     return 1;
   }
 
-  const inputReal = path.resolve(inputPath);
-  if (outPath && path.resolve(outPath) === inputReal) {
+  if (outPath && refusesOutputOverInput(inputPath, outPath)) {
     process.stderr.write(
       `Refusing to write ${outPath}: the migration never overwrites its input. Name a different file.\n`
     );
@@ -998,7 +1031,7 @@ export async function main(argv) {
   const newText = JSON.stringify(migrated.config, null, 2) + "\n";
 
   if (outPath) {
-    if (path.resolve(outPath) === inputReal) {
+    if (refusesOutputOverInput(inputPath, outPath)) {
       process.stderr.write("Refusing to write over the input.\n");
       return 2;
     }

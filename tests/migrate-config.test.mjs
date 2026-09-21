@@ -234,6 +234,24 @@ test("Т-8: скрипт не пишет в исходник; пишет тол�
   );
   assert.equal(fs.readFileSync(src, "utf8"), before);
 
+  // Фикс-раунд 3: --out на СИМЛИНК или ХАРДЛИНК входа — тот же файл по
+  // личности, не по пути. Сравнение путей пропускало запись в живой конфиг
+  // с exit 0; отказ обязан случиться ДО миграции, вход — байт-в-байт.
+  const alias = path.join(dir, "alias.json");
+  fs.symlinkSync(src, alias);
+  assert.throws(
+    () => execFileSync(process.execPath, [SCRIPT, src, "--out", alias], { encoding: "utf8" }),
+    (error) => error.status === 2
+  );
+  assert.equal(fs.readFileSync(src, "utf8"), before, "input untouched through the symlink");
+  const hard = path.join(dir, "hard.json");
+  fs.linkSync(src, hard);
+  assert.throws(
+    () => execFileSync(process.execPath, [SCRIPT, src, "--out", hard], { encoding: "utf8" }),
+    (error) => error.status === 2
+  );
+  assert.equal(fs.readFileSync(src, "utf8"), before, "input untouched through the hardlink");
+
   // Эквивалентность предложенной формы доказана на этой же копии.
   const problems = verifyEquivalence(JSON.parse(before), written);
   assert.deepEqual(problems, []);
