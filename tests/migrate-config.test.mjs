@@ -28,21 +28,25 @@ function liveFleet() {
     [`${role}-deepseek`]: member("deepseek/deepseek-v4-flash", "off", "agent-deepseek", { description: `${role} (deepseek)` }),
     [`${role}-local`]: member("vllm/Qwen3.8-27B", "off", "agent-dind-vllm", { description: `${role} (local)` })
   });
-  const dind = { args: ["--security-opt", "seccomp=@dind.json", "--device", "/dev/net/tun"], env: ["PI_DIND=1"] };
+  const dind = { args: ["--security-opt", "seccomp=@dind.json", "--device", "/dev/net/tun"], env: ["PI_DIND=1"], mounts: ["pi-dind:/var/lib/docker"] };
+  // The owner's live layout (checked against the real file): the trio
+  // agent-dind / agent-dind-vllm / agent-deepseek is byte-identical over
+  // `agent` apart from concurrencyGroup; agent-lite inherits the base WITHOUT
+  // the dind equipment — a difference in substance, it stays its own service.
   return {
     sandboxProfiles: {
-      "agent-base": { image: "pi-agent:latest", env: ["PATH=/t/bin"], mounts: ["/srv:/srv:ro"], args: ["--cpus", "6"] },
-      agent: { profile: "agent-base", ...dind, concurrencyGroup: "zai" },
-      "agent-dind": { profile: "agent-base", ...dind, concurrencyGroup: "zai" },
-      "agent-lite": { profile: "agent-base", concurrencyGroup: "zai" },
-      "agent-dind-vllm": { profile: "agent-base", ...dind, concurrencyGroup: "vllm" },
-      "agent-deepseek": { profile: "agent-base", ...dind, concurrencyGroup: "deepseek" }
+      "agent-base": { image: "pi-sandbox-agent:latest", env: ["PATH=/t/bin"], mounts: ["/srv:/srv:ro"], args: ["--cpus", "6"] },
+      agent: { profile: "agent-base", image: "pi-sandbox-agent:latest", ...dind, concurrencyGroup: "zai" },
+      "agent-dind": { profile: "agent", image: "pi-sandbox-agent:latest", concurrencyGroup: "zai" },
+      "agent-dind-vllm": { profile: "agent", image: "pi-sandbox-agent:latest", concurrencyGroup: "vllm" },
+      "agent-deepseek": { profile: "agent", image: "pi-sandbox-agent:latest", concurrencyGroup: "deepseek" },
+      "agent-lite": { profile: "agent-base", image: "pi-sandbox-agent:latest", concurrencyGroup: "zai" }
     },
     concurrencyPools: { zai: 7, deepseek: 7, vllm: 1 },
     presets: {
-      ...family("go-developer", "agent"),
-      ...family("go-qa", "agent"),
-      ...family("python-developer", "agent"),
+      ...family("go-developer", "agent-dind"),
+      ...family("go-qa", "agent-dind"),
+      ...family("python-developer", "agent-dind"),
       "python-qa-zai": member("zai-coding-cn/glm-5.3-flash", "low", "agent", { systemPrompt: "@qa" }),
       "python-qa-local": member("vllm/Qwen3.8-27B", "off", "agent-dind-vllm", { systemPrompt: "@qa" }),
       ...family("web-developer", "agent"),
@@ -108,19 +112,28 @@ test("Т-3: равные приоритеты — vLLM последней; ме�
   assert.deepEqual(odd.models, ["deepseek-deepseek-v4-flash", "zai-glm-5.3-flash", "vllm-Qwen3.8-27B"]);
 });
 
-test("Т-4: пять профилей сворачиваются в минимальный набор сервисов с extend, без concurrencyGroup", () => {
+test("Т-4: живая раскладка — трио схлопывается в один dind-сервис; база и lite остаются отдельными", () => {
   const raw = liveFleet();
   const { config } = migrateConfig(raw);
   assert.equal(config.sandboxProfiles, undefined);
   assert.deepEqual(
     config.sandboxServices.map((service) => service.id),
-    ["agent-base", "agent"]
+    ["agent-base", "agent", "agent-lite"]
   );
-  assert.equal(config.sandboxServices[1].extend, "agent-base");
-  assert.ok(config.sandboxServices[1].env.includes("PI_DIND=1"));
-  assert.ok(!JSON.stringify(config).includes("concurrencyGroup"), "provider dimension removed");
-  // База не повторяет себя в наследнике.
-  assert.equal(config.sandboxServices[1].image, undefined);
+  const dindService = config.sandboxServices.find((service) => service.id === "agent");
+  assert.equal(dindService.extend, "agent-base");
+  assert.ok(dindService.env.includes("PI_DIND=1"));
+  assert.ok(dindService.args.includes("--device"));
+  assert.ok(dindService.args.includes("/dev/net/tun"));
+  assert.ok(dindService.mounts.includes("pi-dind:/var/lib/docker"));
+  assert.equal(dindService.image, undefined, "the base is not repeated in the heir");
+  // lite наследует базу без dind-оборудования и потому не схлопывается ни с базой, ни с dind-сервисом.
+  const lite = config.sandboxServices.find((service) => service.id === "agent-lite");
+  assert.equal(lite.extend, "agent-base");
+  assert.equal(lite.env, undefined);
+  assert.equal(lite.args, undefined);
+  assert.equal(lite.mounts, undefined);
+  assert.ok(!JSON.stringify(config).includes("concurrencyGroup"), "provider dimension removed from the whole document");
 });
 
 test("Т-5: реестр моделей с глобальными id; пул несёт limit, priority и aliases", () => {
@@ -218,4 +231,65 @@ test("дифф печатается построчно и показывает �
   assert.ok(diff.startsWith("--- old"));
   assert.ok(diff.split("\n").some((line) => line.startsWith("- ") && line.includes("go-developer-zai")));
   assert.ok(diff.split("\n").some((line) => line.startsWith("+ ") && line.includes('"id": "go-developer"')));
+});
+
+// Фикс-раунд 1: правило схлопывания и переезд группы слотов в пул.
+
+test("фикс: различие по args/mounts — отказ с перечнем имён, схлопывать нечего", () => {
+  const raw = liveFleet();
+  // Существенное различие: у deepseek-варианта свой объём памяти — это уже
+  // другой контейнер, эквивалентность на всех старых именах не собрать.
+  raw.sandboxProfiles["agent-deepseek"].args = ["--memory", "8g"];
+  assert.throws(
+    () => migrateConfig(raw),
+    (error) => {
+      assert.match(error.message, /do not collapse|не схлопываются|spans sandbox profiles/);
+      assert.match(error.message, /go-developer-zai/);
+      assert.match(error.message, /go-developer-deepseek/);
+      assert.match(error.message, /go-developer-local/);
+      return true;
+    }
+  );
+});
+
+test("фикс: различие по mounts — отказ, а не схлопывание", () => {
+  const raw = liveFleet();
+  raw.sandboxProfiles["agent-deepseek"].mounts = ["secrets:/secrets:ro"];
+  assert.throws(() => migrateConfig(raw), /spans sandbox profiles/);
+});
+
+test("фикс: группа слотов каждого старого имени равна пулу его модели; расхождение — отказ", () => {
+  const raw = liveFleet();
+  const { config } = migrateConfig(raw);
+  assert.deepEqual(verifyEquivalence(raw, config), []);
+
+  // Владелец перепутал группу у deepseek-профиля: старое имя go-developer-deepseek
+  // считало слоты по группе deepseek, а модель уезжает в пул deepseek — расхождение
+  // обязано назвать и имя, и оба пула.
+  const rewired = JSON.parse(JSON.stringify(raw));
+  rewired.sandboxProfiles["agent-deepseek"].concurrencyGroup = "zai";
+  const problems = verifyEquivalence(rewired, migrateConfig(rewired).config);
+  assert.ok(
+    problems.some((line) => line.includes("go-developer-deepseek") && line.includes("zai") && line.includes("deepseek")),
+    `pool rewiring must be refused, got: ${problems.join(" | ")}`
+  );
+
+  // То же на стороне РЕЗУЛЬТАТА: кто-то испортил выходной пул — сверка ловит.
+  const corrupted = JSON.parse(JSON.stringify(config));
+  const vllm = corrupted.concurrencyPools.find((pool) => pool.pool === "vllm");
+  vllm.aliases = [];
+  assert.ok(verifyEquivalence(raw, corrupted).some((line) => line.includes("go-developer-local")),
+    "breaking the pool alias must be caught for the *-local name");
+});
+
+test("фикс: concurrencyGroup на пресете снимается, назван в dropped, и его нет нигде в выходном документе", () => {
+  const raw = liveFleet();
+  raw.presets["go-developer-zai"].concurrencyGroup = "zai";
+  const { config, dropped } = migrateConfig(raw);
+  assert.ok(!JSON.stringify(config).includes("concurrencyGroup"), "field must not survive anywhere in the output");
+  assert.ok(
+    dropped.some((line) => line.includes("go-developer-zai.concurrencyGroup")),
+    `the removal must be named, got: ${dropped.join(" | ")}`
+  );
+  assert.deepEqual(verifyEquivalence(raw, config), []);
 });

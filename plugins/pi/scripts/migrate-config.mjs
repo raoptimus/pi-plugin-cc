@@ -194,14 +194,21 @@ function buildPools(config, poolOrder) {
 
 /**
  * Resolve each historical profile to its full content (inheritance folded in),
- * minus `concurrencyGroup` — the provider dimension the new form removes.
+ * minus the provider dimension — `concurrencyGroup` and the per-profile
+ * concurrency limit derived from it. Both are carried by the pool of the model
+ * a preset resolves to in the new form (epic D-07: slots come from the pool,
+ * the service describes only the container), so they must never take part in
+ * the collapse decision nor survive into the output.
  */
+const POOL_PORTABLE_FIELDS = ["concurrencyGroup", "maxConcurrent"];
+
 function resolvedProfiles(config) {
   const resolved = new Map();
   for (const [name, profile] of Object.entries(config.sandboxProfiles ?? {})) {
     const full = normalizeSandbox(name, config.sandboxProfiles ?? {});
-    delete full.concurrencyGroup;
-    delete full.maxConcurrent;
+    for (const field of POOL_PORTABLE_FIELDS) {
+      delete full[field];
+    }
     delete full.profileName;
     resolved.set(name, full);
   }
@@ -216,6 +223,14 @@ function resolvedProfiles(config) {
  * delta, otherwise standalone (additive `extend` cannot express a smaller
  * list). The base is the profile other profiles inherit from, named `-base`
  * by convention; its own name is kept.
+ *
+ * The base never absorbs another profile, even a content-equal one: the base
+ * service is the extend root, and a profile the owner declared separately
+ * (`agent-lite` — `agent-base` without the dind equipment) names a service
+ * they expect to see in the output. Content-equal non-base profiles still
+ * share one service; that is what folds the per-provider trio (`agent-dind`,
+ * `agent-dind-vllm`, `agent-deepseek` — byte-identical over `agent` apart
+ * from `concurrencyGroup`) into the single dind service.
  */
 function buildServices(config) {
   const resolved = resolvedProfiles(config);
@@ -228,6 +243,9 @@ function buildServices(config) {
 
   const groups = new Map(); // JSON of resolved content → representative name
   for (const [name, content] of resolved) {
+    if (name === baseName) {
+      continue;
+    }
     const key = JSON.stringify(content);
     if (!groups.has(key)) {
       groups.set(key, []);
@@ -237,23 +255,20 @@ function buildServices(config) {
 
   const services = [];
   const serviceOf = new Map();
+  // The base is written as the owner wrote it, not as the defaults-filled
+  // resolved blob: `normalizeSandbox` folds SANDBOX_DEFAULTS in, and the owner
+  // form should name only what the fleet itself chose.
+  {
+    const { profile, concurrencyGroup, maxConcurrent, ...own } = isPlainObject(config.sandboxProfiles?.[baseName])
+      ? config.sandboxProfiles[baseName]
+      : { ...base };
+    services.push({ id: baseName, ...own });
+    serviceOf.set(baseName, baseName);
+  }
   for (const [, members] of groups) {
     // Shortest member name reads best as a service id (`agent`, not `agent-dind-vllm`).
-    const canonical = [...members].sort((a, b) => a.length - b.length || (a === baseName ? -1 : b === baseName ? 1 : 0))[0];
+    const canonical = [...members].sort((a, b) => a.length - b.length || (a < b ? -1 : 1))[0];
     const content = resolved.get(canonical);
-    if (canonical === baseName) {
-      // The base is written as the owner wrote it, not as the defaults-filled
-      // resolved blob: `normalizeSandbox` folds SANDBOX_DEFAULTS in, and the
-      // owner form should name only what the fleet itself chose.
-      const { profile, concurrencyGroup, maxConcurrent, ...own } = isPlainObject(config.sandboxProfiles?.[canonical])
-        ? config.sandboxProfiles[canonical]
-        : { ...content };
-      services.push({ id: canonical, ...own });
-      for (const member of members) {
-        serviceOf.set(member, canonical);
-      }
-      continue;
-    }
     const delta = {};
     for (const [key, value] of Object.entries(content)) {
       if (key === "profile") {
@@ -306,7 +321,7 @@ function buildFamily(role, members, priorities, serviceOf) {
   const sameForAll = (key) => presets.every((preset) => deepEqual(preset[key], presets[0][key]));
   const common = {};
   for (const key of Object.keys(presets[0])) {
-    if (key === "model" || key === "model2" || key === "sandbox" || key === "description") {
+    if (key === "model" || key === "model2" || key === "sandbox" || key === "description" || key === "concurrencyGroup") {
       continue;
     }
     if (sameForAll(key)) {
@@ -407,12 +422,31 @@ function carrySingle(name, preset, serviceOf, poolNames) {
     carried.sandboxService = service;
   }
   for (const [key, value] of Object.entries(preset)) {
-    if (key === "model" || key === "sandbox") {
+    if (key === "model" || key === "sandbox" || key === "concurrencyGroup") {
       continue;
     }
     carried[key] = value;
   }
   return carried;
+}
+
+/**
+ * Collect the paths of every `concurrencyGroup` left in a document. The field
+ * is the provider dimension the pool takes over (epic D-07), so the migrated
+ * output must not carry it anywhere — services, pools or presets alike.
+ */
+function findConcurrencyGroups(value, pathSoFar, found = []) {
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => findConcurrencyGroups(entry, `${pathSoFar}[${index}]`, found));
+  } else if (isPlainObject(value)) {
+    for (const [key, entry] of Object.entries(value)) {
+      if (key === "concurrencyGroup") {
+        found.push(`${pathSoFar}.${key}`);
+      }
+      findConcurrencyGroups(entry, `${pathSoFar}.${key}`, found);
+    }
+  }
+  return found;
 }
 
 /**
@@ -437,6 +471,11 @@ export function migrateConfig(raw) {
     if (preset.model2 !== undefined) {
       dropped.push(`presets.${name}.model2 (= ${JSON.stringify(preset.model2)}) — не читается ничем, снят`);
     }
+    if (preset.concurrencyGroup !== undefined) {
+      dropped.push(
+        `presets.${name}.concurrencyGroup (= ${JSON.stringify(preset.concurrencyGroup)}) — ушёл в пул выбранной модели`
+      );
+    }
   }
   const presetsOut = [];
   const overrides = new Map();
@@ -460,6 +499,18 @@ export function migrateConfig(raw) {
   newConfig.sandboxServices = services;
   newConfig.concurrencyPools = poolsOut;
   newConfig.presets = presetsOut;
+
+  // Hard invariant of the target form: slots come from the pool of the chosen
+  // model, so the provider dimension has no business anywhere in the output.
+  // A leak here would silently resurrect per-profile slot accounting next to
+  // the pool's.
+  const leaks = findConcurrencyGroups(newConfig, "config");
+  if (leaks.length) {
+    throw new Error(
+      `Internal error: the migrated config still carries concurrencyGroup at ${leaks.join(", ")}. ` +
+        "Slots belong to the model pool in the new form."
+    );
+  }
 
   return { config: newConfig, dropped, serviceOf };
 }
@@ -538,11 +589,34 @@ export function verifyEquivalence(oldRaw, newRaw) {
       }
       const full = normalizeSandbox(sandbox, config.sandboxProfiles ?? {});
       delete full.concurrencyGroup;
-      delete full.maxConcurrent;
+      for (const field of POOL_PORTABLE_FIELDS) {
+      delete full[field];
+    }
       delete full.profileName;
       return full;
     };
     check("sandbox", contour(old, oldSettings.sandbox), contour(fresh, newSettings.sandbox));
+
+    // The provider dimension moved from the profile to the pool: whatever slot
+    // group the old name drew through its sandbox profile must now equal the
+    // pool of the model it resolves to (pool aliases count — `*-local` said
+    // `vllm`). Otherwise the migration rewired who counts slots.
+    const oldSandbox = old.presets[name]?.sandbox;
+    if (typeof oldSandbox === "string" && old.sandboxProfiles?.[oldSandbox]) {
+      const group = normalizeSandbox(oldSandbox, old.sandboxProfiles ?? {}).concurrencyGroup;
+      if (group != null) {
+        const pool = Object.values(fresh.concurrencyPools ?? {}).find((entry) =>
+          Object.values(entry.models ?? {}).some((model) => model.provider === variant.provider)
+        );
+        if (!pool) {
+          problems.push(`${name}: модель "${variant.model}" не входит ни в один пул новой конфигурации.`);
+        } else if (pool.pool !== group && !(pool.aliases ?? []).includes(group)) {
+          problems.push(
+            `${name}: группа слотов "${group}" профиля "${oldSandbox}" не совпадает с пулом "${pool.pool}" модели "${variant.model}".`
+          );
+        }
+      }
+    }
   }
   return problems;
 }
