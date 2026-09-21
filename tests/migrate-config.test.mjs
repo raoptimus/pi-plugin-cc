@@ -511,3 +511,27 @@ test("фикс-раунд 3: сверка не срезает maxConcurrent у �
   freshWithCap.sandboxServices[0].maxConcurrent = 2;
   assert.deepEqual(verifyEquivalence(old, freshWithCap), [], "matching caps prove equivalent");
 });
+
+// Фикс-раунд 3: отказ схлопывания закреплён за КАЖДЫМ существенным полем
+// сервиса, а не только за args и mounts — иначе добавление поля в список
+// переносимых проходит незамеченным.
+
+test("фикс-раунд 3: различие профиля семейства ровно по полю X — отказ (параметризованно)", async (t) => {
+  const cases = [
+    ["args", ["--memory", "8g"]],
+    ["mounts", ["secrets:/secrets:ro"]],
+    ["image", "pi-sandbox-other:latest"],
+    ["skills", ["/pi-skills/vision"]],
+    ["user", "root"],
+    ["network", "host"],
+    ["extensions", ["/ext/extra"]]
+  ];
+  for (const [field, value] of cases) {
+    await t.test(`поле ${field}`, () => {
+      const raw = liveFleet();
+      raw.sandboxProfiles["agent-deepseek"][field] = value;
+      // Поле уходит от базы, но НЕ входит в переносимые: схлопывать нечего.
+      assert.throws(() => migrateConfig(raw), /spans sandbox profiles/, `${field} must block the collapse`);
+    });
+  }
+});
