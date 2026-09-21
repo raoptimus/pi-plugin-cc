@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { lineDiff, migrateConfig, verifyEquivalence } from "../plugins/pi/scripts/migrate-config.mjs";
+import { lineDiff, migrateConfig, verifyEquivalence , declaredDivergences} from "../plugins/pi/scripts/migrate-config.mjs";
 
 const SCRIPT = path.resolve(path.dirname(decodeURIComponent(new URL(import.meta.url).pathname)), "../plugins/pi/scripts/migrate-config.mjs");
 
@@ -321,20 +321,45 @@ test("фикс-раунд 2: теги остаются у роли, записи
   );
 });
 
-test("фикс-раунд 2: разные надбавки к тегам одной модели с разных ролей — отказ с именами, не выбор молча", () => {
+test("надбавка к тегам от МЕНЬШИНСТВА пользователей модели — отказ с именами, не тихий выбор", () => {
   const raw = liveFleet();
-  // python-developer: deepseek-член несёт роль ещё и тег "coverage" — это
-  // различие внутри семейства, оно просится на запись deepseek-модели, которой
-  // пользуются и другие роли без этой надбавки.
+  // Роль просит на свою deepseek-модель тег, которого нет у остальных её
+  // пользователей: запись модели одна, и такой тег уехал бы на чужие роли.
   raw.presets["python-developer-deepseek"].tags = ["dev", "python", "coverage"];
   assert.throws(
     () => migrateConfig(raw),
     (error) => {
       assert.match(error.message, /Model "deepseek\/deepseek-v4-flash" is demanded different tag extras/);
       assert.match(error.message, /python-developer-deepseek/);
-      assert.match(error.message, /go-developer-deepseek|coverage-auditor/);
       return true;
     }
+  );
+});
+
+test("надбавка от БОЛЬШИНСТВА пользователей модели переезжает на модель, и различие названо громко", () => {
+  const raw = liveFleet();
+  // Метка, которую несёт большинство пользователей модели, описывает саму
+  // модель: в живой конфигурации `local` стоит у трёх локальных ролей из пяти,
+  // а rust-варианты той же модели её забыли. Фикстура такой расклад не несёт —
+  // выставляем его явно, чтобы кейс проверял ПРАВИЛО, а не содержимое фикстуры.
+  const localUsers = Object.entries(raw.presets)
+    .filter(([, preset]) => String(preset.model).startsWith("vllm/"))
+    .map(([name]) => name);
+  assert.ok(localUsers.length >= 3, `фикстуре нужны минимум три пользователя локальной модели: ${localUsers}`);
+  for (const name of localUsers.slice(0, localUsers.length - 1)) {
+    raw.presets[name].tags = [...(raw.presets[name].tags ?? []), "local"];
+  }
+  const forgotten = localUsers[localUsers.length - 1];
+  raw.presets[forgotten].tags = (raw.presets[forgotten].tags ?? []).filter((tag) => tag !== "local");
+  const migrated = migrateConfig(raw);
+  const vllm = migrated.config.concurrencyPools.find((entry) => entry.pool === "vllm");
+  const model = vllm.models.find((entry) => entry.name === "Qwen3.8-27B");
+  assert.deepEqual(model.tags, ["local"], "метка большинства стоит на записи модели");
+  const declared = declaredDivergences().filter((entry) => entry.field === "tags");
+  assert.ok(declared.length > 0, "роль, получившая метку, обязана быть названа, а не изменена молча");
+  assert.ok(
+    declared.some((entry) => entry.preset === forgotten && entry.now.includes("local")),
+    `роль без метки обязана быть названа: ${JSON.stringify(declared.map((e) => e.preset))}`
   );
 });
 

@@ -70,21 +70,24 @@ function modelId(pool, name) {
   return `${pool}-${name}`;
 }
 
-/** Longest common prefix at a word boundary — for folding family descriptions. */
+/**
+ * Описание роли — самое частое описание семейства, а НЕ общий префикс символов.
+ *
+ * Префикс режет фразу по месту, где разошлись строки: у живого семейства два
+ * члена описаны одинаково, а третий добавляет «— на локальной модели vLLM», и
+ * общий префикс дал «…юнит-тесты, гейты,» — оборванное на запятой описание,
+ * которое человек читает в списке пресетов. Берём описание большинства целиком;
+ * различие членов видно из моделей роли, а не из огрызка фразы.
+ */
 function commonDescription(descriptions) {
-  if (!descriptions.length) {
+  const texts = descriptions.filter((text) => typeof text === "string" && text.trim());
+  if (!texts.length) {
     return undefined;
   }
-  let prefix = descriptions[0];
-  for (const text of descriptions.slice(1)) {
-    let at = 0;
-    while (at < prefix.length && at < text.length && prefix[at] === text[at]) {
-      at += 1;
-    }
-    prefix = prefix.slice(0, at);
-  }
-  const cut = prefix.lastIndexOf(" ");
-  return (cut > 0 ? prefix.slice(0, cut) : prefix).trimEnd();
+  const ranked = [...new Set(texts)]
+    .map((text) => [text, texts.filter((other) => other === text).length])
+    .sort((a, b) => b[1] - a[1] || texts.indexOf(a[0]) - texts.indexOf(b[0]));
+  return ranked[0][0].trim();
 }
 
 /**
@@ -315,6 +318,22 @@ function buildServices(config) {
  * возвращала undefined, и миграция отказывала на каждой роли живого конфига —
  * при том что на фикстуре со строковыми ссылками проходила.
  */
+/**
+ * Осознанно снятые различия: печатаются громко и не валят сверку.
+ *
+ * Отказ — правильная реакция на различие, которого не должно быть; но упираться
+ * в ОДНУ строку живой конфигурации значит блокировать миграцию целиком. Такое
+ * различие снимается, называется в предъявляемом диффе и регистрируется здесь,
+ * чтобы сверка не принимала его ни за ошибку, ни за «всё совпало». Молчания нет
+ * ни в одном из двух направлений.
+ */
+const DECLARED = [];
+
+/** Копия объявленных расхождений: тест обязан проверять, что различие НАЗВАНО. */
+export function declaredDivergences() {
+  return DECLARED.map((entry) => ({ ...entry }));
+}
+
 function profileNameOf(sandbox) {
   if (typeof sandbox === "string") {
     return sandbox;
@@ -370,13 +389,30 @@ function buildFamily(role, members, priorities, serviceOf) {
   // Собственный env роли у всех членов семейства общий (это env РОЛИ, а не
   // провайдера); расхождение — признак того, что схлопывать нельзя.
   const extrasList = entries.map((member) => sandboxExtrasOf(member.preset.sandbox) ?? {});
+  // Различие собственного env внутри семейства встречается в живой конфигурации
+  // ОДИН раз (у одного члена лишний core.hooksPath, которого нет у братьев), и
+  // отказ на этом месте блокирует миграцию целиком. Берём вариант большинства, а
+  // снятое различие объявляем громко: дифф предъявляется владельцу, решение его.
+  let sharedIndex = 0;
   if (extrasList.some((extras) => !deepEqual(extras, extrasList[0]))) {
-    throw new Error(
-      `Role "${role}" members carry different sandbox env (${names.join(", ")}) — ` +
-        "the role's own env must be identical across a family for it to collapse."
-    );
+    const ranked = extrasList
+      .map((extras, index) => [index, extrasList.filter((other) => deepEqual(other, extras)).length])
+      .sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+    sharedIndex = ranked[0][0];
+    entries.forEach((member, index) => {
+      if (deepEqual(extrasList[index], extrasList[sharedIndex])) {
+        return;
+      }
+      DECLARED.push({
+        preset: member.name,
+        field: "sandbox",
+        reason: `роль "${role}" схлопывается в один пресет, а собственный env членов семейства различался`,
+        was: extrasList[index].env ?? extrasList[index],
+        now: extrasList[sharedIndex].env ?? extrasList[sharedIndex]
+      });
+    });
   }
-  const sharedExtras = Object.keys(extrasList[0]).length ? extrasList[0] : null;
+  const sharedExtras = Object.keys(extrasList[sharedIndex]).length ? extrasList[sharedIndex] : null;
 
   const sameForAll = (key) => presets.every((preset) => deepEqual(preset[key], presets[0][key]));
   const common = {};
@@ -477,16 +513,46 @@ function solveModelTags(familyPlans, singles) {
   const resolved = new Map();
   for (const [key, list] of demands) {
     const distinct = new Map(list.map((demand) => [JSON.stringify(demand.extra), demand]));
-    if (distinct.size > 1) {
-      const named = list.map((demand) => `${demand.name} (${JSON.stringify(demand.extra)})`).join(", ");
+    // Тег — метка, а не поведение, но налепить метку ОДНОЙ роли на всех
+    // пользователей модели нельзя: так `coverage` уехал бы на go-developer.
+    // Переезжает на модель только то, чего требует БОЛЬШИНСТВО её пользователей
+    // — такая метка описывает саму модель, а не роль (в живой конфигурации это
+    // `local`: его несут три локальные роли из пяти, а rust-варианты той же
+    // модели забыли). Меньшинство — по-прежнему отказ с именами: различие
+    // роли не выражается записью модели, и угадывать тут нечего.
+    const users = list.length;
+    const votes = new Map();
+    for (const { extra } of list) {
+      for (const tag of new Set(extra)) {
+        votes.set(tag, (votes.get(tag) ?? 0) + 1);
+      }
+    }
+    const union = [...votes.keys()].filter((tag) => votes.get(tag) * 2 > users);
+    const minority = [...votes.keys()].filter((tag) => votes.get(tag) * 2 <= users);
+    if (minority.length) {
+      const named = list
+        .filter((demand) => demand.extra.some((tag) => minority.includes(tag)))
+        .map((demand) => `${demand.name} (${JSON.stringify(demand.extra)})`)
+        .join(", ");
       throw new Error(
         `Model "${key}" is demanded different tag extras by ${named} — ` +
           "one model record would paste one role's tags onto the others; reconcile the roles by hand."
       );
     }
-    const [{ extra }] = distinct.values();
-    if (extra.length) {
-      resolved.set(key, extra);
+    for (const demand of list) {
+      const gained = union.filter((tag) => !demand.extra.includes(tag));
+      if (gained.length) {
+        DECLARED.push({
+          preset: demand.name,
+          field: "tags",
+          reason: `метка ${JSON.stringify(gained)} описывает модель "${key}" (её требует большинство ролей), а этой роли не стояла`,
+          was: demand.extra,
+          now: union
+        });
+      }
+    }
+    if (union.length) {
+      resolved.set(key, union);
     }
   }
   return resolved;
@@ -712,10 +778,14 @@ export function migrateConfig(raw) {
  *
  * Returns a list of mismatch descriptions; empty means equivalent.
  */
-export function verifyEquivalence(oldRaw, newRaw) {
+export function verifyEquivalence(oldRaw, newRaw, declared = []) {
   const old = normalizeConfigLayer(oldRaw);
   const fresh = normalizeConfigLayer(JSON.parse(JSON.stringify(newRaw)));
   const problems = [];
+  // Объявленное расхождение не ошибка и не совпадение: его печатает отдельный
+  // громкий список, поэтому здесь оно молча пропускается ровно по своей паре
+  // «пресет + поле», а не по пресету целиком.
+  const accepted = new Set(declared.map((entry) => `${entry.preset}|${entry.field}`));
 
   for (const name of Object.keys(old.presets ?? {})) {
     const reference = resolvePresetReference(fresh, name);
@@ -733,6 +803,9 @@ export function verifyEquivalence(oldRaw, newRaw) {
     const variant = variants[0];
 
     const check = (field, oldValue, newValue) => {
+      if (accepted.has(`${name}|${field}`)) {
+        return;
+      }
       if (!deepEqual(oldValue, newValue)) {
         problems.push(
           `${name}: ${field} расходится — старая ${JSON.stringify(oldValue)}, новая ${JSON.stringify(newValue)}.`
@@ -898,7 +971,7 @@ export async function main(argv) {
     return 1;
   }
 
-  const problems = verifyEquivalence(raw, migrated.config);
+  const problems = verifyEquivalence(raw, migrated.config, DECLARED);
   if (problems.length) {
     process.stderr.write(
       `Equivalence FAILED for ${problems.length} check(s); nothing was written:\n` +
@@ -906,6 +979,19 @@ export async function main(argv) {
         "\n"
     );
     return 1;
+  }
+
+  if (DECLARED.length) {
+    process.stdout.write(
+      "ВНИМАНИЕ — осознанно снятые различия (решение за владельцем):\n" +
+        DECLARED.map(
+          (entry) =>
+            `  - ${entry.preset}: ${entry.reason}\n` +
+            `      было: ${JSON.stringify(entry.was)}\n` +
+            `      стало: ${JSON.stringify(entry.now)}`
+        ).join("\n") +
+        "\n\n"
+    );
   }
 
   const oldText = JSON.stringify(raw, null, 2) + "\n";
