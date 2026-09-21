@@ -164,7 +164,7 @@ test("the owner's example reads verbatim: three arrays become a preset with mode
   const zai = variants[0];
   assert.equal(zai.model, "zai-coding-cn/glm-5.3-flash");
   assert.equal(zai.pool, "zai");
-  assert.equal(zai.sandbox.concurrencyGroup, "zai", "slots come from the pool of the model");
+  assert.equal(zai.sandbox.poolName, "zai", "slots come from the pool of the model");
   assert.equal(zai.sandbox.maxConcurrent, 5);
   assert.equal(zai.sandbox.profileName, "sandbox-agent", "one sandbox for the role, named by the preset");
 
@@ -244,32 +244,43 @@ test("extend folds the base's lists in; a cycle is refused with the chain", asyn
   assert.throws(() => normalizeSandbox("a", cycle.sandboxProfiles), /extends itself: a → b/);
 });
 
-test("old forms keep working: maps, numeric pools, concurrencyGroup profiles", async () => {
-  const { normalizeConcurrencyPool, BUILT_IN_CONFIG, mergeConfigLayer } = await import(
+test("old forms keep working: maps, numeric pools; concurrencyGroup is refused, naming the replacement", async () => {
+  const { normalizeConcurrencyPool, normalizeConfigLayer, refuseRemovedConcurrencyGroup } = await import(
     "../plugins/pi/scripts/lib/config.mjs"
   );
-  const { applyConcurrencyPool } = await import("../plugins/pi/scripts/pi-companion.mjs");
   const { normalizeSandbox } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
 
   assert.deepEqual(normalizeConcurrencyPool(7), { limit: 7 });
 
   const today = {
     concurrencyPools: { zai: 7 },
-    sandboxProfiles: { agent: { image: "busybox:latest", concurrencyGroup: "zai" } },
-    presets: { "python-developer-zai": { model: "zai/gpt-5", thinking: "high", sandbox: "agent" } }
+    sandboxProfiles: { agent: { image: "busybox:latest", maxConcurrent: 7 } },
+    presets: { "python-developer": { model: "zai/gpt-5", thinking: "high", sandbox: "agent" } }
   };
   // Normalization is a no-op on today's shape, apart from reading each numeric
   // pool as its {limit} record.
   assert.deepEqual(normalizeConfigLayer(today), {
     concurrencyPools: { zai: { limit: 7 } },
-    sandboxProfiles: { agent: { image: "busybox:latest", concurrencyGroup: "zai" } },
-    presets: { "python-developer-zai": { model: "zai/gpt-5", thinking: "high", sandbox: "agent" } }
+    sandboxProfiles: { agent: { image: "busybox:latest", maxConcurrent: 7 } },
+    presets: { "python-developer": { model: "zai/gpt-5", thinking: "high", sandbox: "agent" } }
   });
+  const merged = normalizeConfigLayer(today);
+  assert.equal(normalizeSandbox("agent", merged.sandboxProfiles).maxConcurrent, 7);
 
-  const merged = mergeConfigLayer(BUILT_IN_CONFIG, normalizeConfigLayer(today));
-  const sandbox = applyConcurrencyPool(normalizeSandbox("agent", merged.sandboxProfiles), merged);
-  assert.equal(sandbox.concurrencyGroup, "zai");
-  assert.equal(sandbox.maxConcurrent, 7);
+  // The profile-level pool is a removed form: refusal, not silent ignore — a
+  // silently ignored field leaves a config that looks tuned and is not.
+  assert.throws(
+    () =>
+      refuseRemovedConcurrencyGroup(
+        normalizeConfigLayer({ sandboxProfiles: { agent: { image: "img", concurrencyGroup: "zai" } } })
+      ),
+    /removed "concurrencyGroup" field.*"concurrencyPools"/s,
+    "the refusal names what replaced the field"
+  );
+  assert.throws(
+    () => refuseRemovedConcurrencyGroup(normalizeConfigLayer({ presets: [{ id: "role", concurrencyGroup: "zai" }] })),
+    /Preset "role" uses the removed "concurrencyGroup" field.*"concurrencyPools"/s
+  );
 });
 
 test("a project layer with one pool does not wipe the user's pools, and cannot point models at a provider", async () => {
@@ -441,9 +452,9 @@ test("models of one pool share one quota, and a bare number still reads as a lim
   const smart = variantById(variants, `smart-${UNIQUE}`);
   const other = variantById(variants, `other-${UNIQUE}`);
 
-  assert.equal(fast.sandbox.concurrencyGroup, fast.pool, "the pool is the quota scope, not the model");
+  assert.equal(fast.sandbox.poolName, fast.pool, "the pool is the quota scope, not the model");
   assert.equal(fast.sandbox.maxConcurrent, 1);
-  assert.equal(smart.sandbox.concurrencyGroup, fast.sandbox.concurrencyGroup, "same pool, same scope");
+  assert.equal(smart.sandbox.poolName, fast.sandbox.poolName, "same pool, same scope");
 
   // A slot held by `fast` must be visible to `smart` of the SAME pool, while a
   // different pool with the same limit is untouched.
@@ -666,7 +677,7 @@ test("the run path resolves a models preset end to end", async (t) => {
     assert.equal(settings.sandboxVariants.length, 2, "both pools became candidates");
     // buildRunSettings reshapes the stand-in (identity env, isolateCaches), so
     // compare the shape, not the object identity.
-    assert.equal(settings.sandbox.concurrencyGroup, settings.sandboxVariants[0].sandbox.concurrencyGroup,
+    assert.equal(settings.sandbox.poolName, settings.sandboxVariants[0].sandbox.poolName,
       "the first candidate stands in until slot time");
     assert.equal(settings.sandbox.profileName, "agent");
     assert.equal(settings.model, null, "the model comes from the candidate, picked at slot time");
@@ -692,7 +703,7 @@ test("the slot-time pick keeps the developed sandbox and moves only model-choice
       gitProxyHosts: { "github.com": "127.0.0.1:0" },
       mounts: ["/need:/need:ro"],
       env: ["GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t"],
-      concurrencyGroup: `alpha-${UNIQUE}`,
+      poolName: `alpha-${UNIQUE}`,
       maxConcurrent: 1
     },
     thinking: "high",
@@ -703,7 +714,7 @@ test("the slot-time pick keeps the developed sandbox and moves only model-choice
     model: "prov/smart-model",
     thinking: "low",
     samplingParams: { max_tokens: 4096 },
-    sandbox: { concurrencyGroup: `beta-${UNIQUE}`, maxConcurrent: 2, heldSlot: { waitedMs: 5, release: () => {} } }
+    sandbox: { poolName: `beta-${UNIQUE}`, maxConcurrent: 2, heldSlot: { waitedMs: 5, release: () => {} } }
   });
 
   assert.equal(settings.sandbox.isolateCaches, true, "cache isolation survives the pick");
@@ -715,7 +726,7 @@ test("the slot-time pick keeps the developed sandbox and moves only model-choice
   );
   assert.equal(settings.sandbox.provider, "prov", "the winner's provider keys the credential proxy");
   assert.deepEqual(settings.sandbox.samplingParams, { max_tokens: 4096 });
-  assert.equal(settings.sandbox.concurrencyGroup, `beta-${UNIQUE}`, "the pool fields follow the winner");
+  assert.equal(settings.sandbox.poolName, `beta-${UNIQUE}`, "the pool fields follow the winner");
   assert.equal(settings.sandbox.maxConcurrent, 2);
   assert.equal(settings.sandbox.heldSlot.waitedMs, 5, "the claimed slot travels in the sandbox");
   assert.equal(settings.model, "prov/smart-model");
@@ -843,6 +854,36 @@ test("loadConfig normalizes owner-form arrays before merging: the user's pools s
     "the project's single pool did not wipe the user's two"
   );
   assert.equal(config.presets.role.sandbox, "svc", "the user's preset survived whole");
+});
+
+// Отказ снятого поля должен срабатывать в реальном конвейере загрузки, на обоих
+// слоях, и называть замену — иначе конфиг выглядит настроенным и не работает.
+test("loadConfig refuses concurrencyGroup on a profile and on a preset, naming the replacement", async (t) => {
+  const { loadConfig } = await import("../plugins/pi/scripts/lib/config.mjs");
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-pools-home-"));
+  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-pools-ws-"));
+  fs.mkdirSync(path.join(home, ".claude", "pi"), { recursive: true });
+  fs.mkdirSync(path.join(workspaceRoot, ".claude", "pi"), { recursive: true });
+  const realHome = process.env.HOME;
+  process.env.HOME = home;
+  t.after(() => {
+    process.env.HOME = realHome;
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  fs.writeFileSync(
+    path.join(home, ".claude", "pi", "config.json"),
+    JSON.stringify({ sandboxProfiles: { agent: { image: "img", concurrencyGroup: "zai" } } })
+  );
+  assert.throws(() => loadConfig(workspaceRoot), /Sandbox profile "agent" uses the removed "concurrencyGroup" field.*"concurrencyPools"/s);
+
+  fs.writeFileSync(
+    path.join(home, ".claude", "pi", "config.json"),
+    JSON.stringify({ presets: [{ id: "role", concurrencyGroup: "zai" }] })
+  );
+  assert.throws(() => loadConfig(workspaceRoot), /Preset "role" uses the removed "concurrencyGroup" field.*"concurrencyPools"/s);
 });
 
 // Т-2: сервис и профиль с одним именем живут в одном пространстве — сервис

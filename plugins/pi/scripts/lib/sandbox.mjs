@@ -401,8 +401,8 @@ export function buildDockerRunArgs({
     // it from inside on Linux, where it is not resolvable by default.
     args.push("--add-host", "host.docker.internal:host-gateway");
   }
-  if (sandbox.concurrencyGroup) {
-    args.push("--label", `${LABEL}-pool=${sandbox.concurrencyGroup}`);
+  if (sandbox.poolName) {
+    args.push("--label", `${LABEL}-pool=${sandbox.poolName}`);
   }
 
   if (containerName) {
@@ -1047,16 +1047,16 @@ function reserveSlot(scopeKey) {
 
 export function describeSlotUsage(sandbox) {
   const limit = slotLimitOf(sandbox);
-  const group = sandbox?.concurrencyGroup ?? null;
-  const value = group ?? sandbox?.profileName ?? null;
+  const pool = sandbox?.poolName ?? null;
+  const value = pool ?? sandbox?.profileName ?? null;
   if (!isSandboxed(sandbox) || !value || !Number.isFinite(limit) || limit <= 0) {
     return null;
   }
-  const scopeKey = slotScopeKey(group ? "pool" : "profile", value);
+  const scopeKey = slotScopeKey(pool ? "pool" : "profile", value);
   return {
-    used: countRunningForLabel(group ? "pool" : "profile", value) + countReservations(scopeKey, { sweep: false }),
+    used: countRunningForLabel(pool ? "pool" : "profile", value) + countReservations(scopeKey, { sweep: false }),
     limit,
-    scope: group ? `pool \`${group}\`` : `profile \`${sandbox.profileName}\``
+    scope: pool ? `pool \`${pool}\`` : `profile \`${sandbox.profileName}\``
   };
 }
 
@@ -1083,12 +1083,12 @@ export async function awaitSandboxSlot(sandbox, { timeoutMs = 900_000, onProgres
     };
   }
   const limit = slotLimitOf(sandbox);
-  // Slots belong to a pool when the profile names one, and to the profile
-  // otherwise. A pool is what a shared provider needs: several profiles hitting
-  // the same account have to draw from one allowance, while a profile counting
-  // only itself would let them exceed it together.
-  const scope = sandbox?.concurrencyGroup
-    ? { label: "pool", value: String(sandbox.concurrencyGroup), what: `pool "${sandbox.concurrencyGroup}"` }
+  // Slots belong to a pool when the run's selected model names one, and to the
+  // profile otherwise. A pool is what a shared provider needs: several roles
+  // hitting the same account have to draw from one allowance, while a profile
+  // counting only itself would let them exceed it together.
+  const scope = sandbox?.poolName
+    ? { label: "pool", value: String(sandbox.poolName), what: `pool "${sandbox.poolName}"` }
     : { label: "profile", value: sandbox?.profileName ?? null, what: `profile "${sandbox?.profileName}"` };
 
   if (!isSandboxed(sandbox) || !scope.value || !Number.isFinite(limit) || limit <= 0) {

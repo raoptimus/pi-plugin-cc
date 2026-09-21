@@ -29,7 +29,7 @@ import { BUILT_IN_CONFIG } from "../plugins/pi/scripts/lib/config.mjs";
 const CONFIG = {
   ...BUILT_IN_CONFIG,
   sandboxProfiles: {
-    gpu: { mode: "docker", concurrencyGroup: "zai-pool" },
+    gpu: { mode: "docker" },
     plain: { mode: "docker" }
   },
   presets: {
@@ -74,10 +74,9 @@ test("500 не считается сетевым отказом: он прихо
   assert.equal(classifyFailure("500 internal error while parsing the request"), "unknown");
 });
 
-test("пул пресета: группа профиля, иначе имя профиля", () => {
-  assert.equal(presetPool({ sandbox: "gpu" }, CONFIG), "zai-pool");
+test("пул пресета: имя профиля, а без песочницы — null", () => {
+  assert.equal(presetPool({ sandbox: "gpu" }, CONFIG), "gpu");
   assert.equal(presetPool({ sandbox: "plain" }, CONFIG), "plain");
-  assert.equal(presetPool({ sandbox: { profile: "gpu", maxConcurrent: 1 } }, CONFIG), "zai-pool");
   assert.equal(presetPool({}, CONFIG), null, "без песочницы пула нет");
   assert.equal(presetPool({ sandbox: "no-such-profile" }, CONFIG), null, "битый профиль — не повод падать на старте");
 });

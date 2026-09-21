@@ -669,7 +669,7 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
       `The agent runs in ${runRoot}, outside this workspace. Its edits land there, not in ${workspaceRoot}.`
     );
   }
-  let sandbox = applyConcurrencyPool(sandboxForRun(settings, config), config);
+  let sandbox = sandboxForRun(settings, config);
   let worktreeMount = null;
   if (settings.mounts.length && !isSandboxed(sandbox)) {
     // Without a container there is nothing to mount into: pi already sees the
@@ -932,7 +932,7 @@ export function applyPickedVariant(settings, picked) {
     // not on whichever candidate stood in during preflight.
     provider: picked.provider,
     samplingParams: picked.samplingParams ?? undefined,
-    concurrencyGroup: picked.sandbox.concurrencyGroup,
+    poolName: picked.sandbox.poolName,
     maxConcurrent: picked.sandbox.maxConcurrent,
     ...(picked.sandbox.heldSlot ? { heldSlot: picked.sandbox.heldSlot } : {})
   };
@@ -1005,7 +1005,7 @@ export function selectLiveVariants(variants, { now = Date.now() } = {}) {
  * record and read none, whatever the state file holds.
  */
 export function settlePoolHealth(settings, execution, thrownError) {
-  const pool = settings?.sandbox?.concurrencyGroup;
+  const pool = settings?.sandbox?.poolName;
   if (!pool || !settings?.poolCooldowns) {
     return null;
   }
@@ -1365,32 +1365,6 @@ function providerOf(settings) {
 }
 
 /**
- * Resolve a profile's slot allowance from the pool it belongs to.
- *
- * The limit lives with the pool rather than with each profile, so profiles
- * sharing a provider cannot disagree about how many sessions that provider
- * allows. A profile that names no pool keeps whatever `maxConcurrent` it set
- * for itself, which is the default and needs no configuration at all.
- */
-export function applyConcurrencyPool(sandbox, config) {
-  const group = sandbox?.concurrencyGroup;
-  if (!group) {
-    return sandbox;
-  }
-  const raw = config?.concurrencyPools?.[group];
-  if (raw == null) {
-    throw new Error(
-      `Sandbox profile references concurrency pool "${group}", which is not defined. ` +
-        `Add "concurrencyPools": {"${group}": <slots>} to the config, or drop concurrencyGroup.`
-    );
-  }
-  // Already normalized with its layer; re-validating here would reject the
-  // pool's own model registry the normalizer just built.
-  const limit = typeof raw === "number" ? raw : Number(raw?.limit);
-  return { ...sandbox, maxConcurrent: limit };
-}
-
-/**
  * The model registry: every pool's `models` records indexed by their globally
  * unique id. Built from the merged config at use time — pools are merged entry
  * by entry across layers, so the registry reflects whatever layers survived.
@@ -1420,7 +1394,7 @@ export function modelRegistry(config) {
  * `samplingParams`; the preset lists ids in preference order and names one
  * sandbox for the role. The pool each candidate draws slots from is the pool
  * its record sits in — by construction every model of one account shares one
- * quota (`concurrencyGroup = <pool>`, `maxConcurrent = pool.limit`), which is
+ * quota (`poolName = <pool>`, `maxConcurrent = pool.limit`), which is
  * what makes two models of one account stay inside its allowance.
  *
  * `poolPin` (from a `<role>-<pool|alias|modelId>` alias) narrows the candidates
@@ -1437,7 +1411,7 @@ export function buildVariants(preset, config, { poolPin = null, modelWanted = nu
   const registry = modelRegistry(config);
   const pools = config.concurrencyPools ?? {};
   // One sandbox for the role, resolved once: the preset names the service, the
-  // pool of the chosen model only adds the slot scope and its limit.
+  // pool of the chosen model adds its name (the slot scope) and its limit.
   const roleSandbox = normalizeSandbox(preset.sandbox ?? null, config.sandboxProfiles ?? {});
 
   const variants = ids.map((id, index) => {
@@ -1460,7 +1434,7 @@ export function buildVariants(preset, config, { poolPin = null, modelWanted = nu
     const limit = Number(pool.limit);
     const sandbox = {
       ...roleSandbox,
-      concurrencyGroup: model.pool,
+      poolName: model.pool,
       maxConcurrent: limit,
       ...(isPlainObject(model.samplingParams) ? { samplingParams: model.samplingParams } : {})
     };
