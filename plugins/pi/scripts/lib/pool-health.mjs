@@ -50,7 +50,7 @@ const POOL_FAILURE_CLASSES = [
   ],
   [
     "quota",
-    /\b429\b|"code"\s*:\s*"1310"|usage limit reached|quota exceeded|rate limit exceeded|weekly usage limit/i
+    /\b429\b|"code"\s*:\s*"?1310"?\b|usage limit reached|quota exceeded|rate limit exceeded|weekly usage limit/i
   ],
   [
     "network",

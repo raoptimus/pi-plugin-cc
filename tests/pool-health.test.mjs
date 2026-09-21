@@ -43,6 +43,9 @@ test("failures of the pool are classified; failures of the task are not", async 
   // Quota: status code, the provider's code 1310, the weekly-limit wording.
   assert.equal(classifyPoolFailure("429 Too Many Requests").class, "quota");
   assert.equal(classifyPoolFailure('{"error":{"code":"1310"}}').class, "quota");
+  // The same code arrives numeric just as often.
+  assert.equal(classifyPoolFailure('{"error":{"code":1310}}').class, "quota");
+  assert.equal(classifyPoolFailure('{"error":{"code":13100}}'), null, "a longer code is a different code");
   assert.equal(classifyPoolFailure("Weekly usage limit reached for this account").class, "quota");
   // Network: the endpoint is not there at all.
   for (const text of [
