@@ -945,9 +945,8 @@ export function applyPickedVariant(settings, picked) {
   if (picked.thinking != null && !settings.thinkingFromFlag) {
     settings.thinking = picked.thinking;
   }
-  if (picked.tags?.length || settings.tags?.length) {
-    settings.tags = [...(settings.tags ?? []), ...(picked.tags ?? [])];
-  }
+  // Model records carry no tags (owner decision): the only consumer read the
+  // preset's, so a per-model tag had nowhere to go and nothing to say.
 }
 
 /**
@@ -1417,7 +1416,7 @@ export function modelRegistry(config) {
 /**
  * Expand a preset's `models` list into the concrete candidates it may run as.
  *
- * A model record carries provider, name and (optionally) thinking, tags and
+ * A model record carries provider, name and (optionally) thinking and
  * `samplingParams`; the preset lists ids in preference order and names one
  * sandbox for the role. The pool each candidate draws slots from is the pool
  * its record sits in — by construction every model of one account shares one
@@ -1472,7 +1471,6 @@ export function buildVariants(preset, config, { poolPin = null, modelWanted = nu
       provider: model.provider,
       model: `${model.provider}/${model.name}`,
       thinking: model.thinking ?? null,
-      tags: Array.isArray(model.tags) ? model.tags : [],
       samplingParams: isPlainObject(model.samplingParams) ? model.samplingParams : null,
       sandbox
     };

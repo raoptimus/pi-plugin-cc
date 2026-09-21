@@ -4,7 +4,7 @@
  * five sandbox profiles, `concurrencyPools` as bare slot numbers) into the
  * owner form — one preset per role with a `models` list, a model registry with
  * globally unique ids, sandbox services with `extend`, pools with
- * `limit`/`priority`/`aliases`.
+ * `limit`/`priority`.
  *
  * The script NEVER writes to its input. It reads the old config, builds the
  * new one, PROVES equivalence (T-6: for every old preset name the resolved
@@ -198,7 +198,6 @@ function buildPools(config, poolOrder) {
       // The owner's example keeps every pool at the same priority and orders
       // candidates by the preset's model list; the number stays configurable.
       priority: Number.isFinite(Number(old?.priority)) ? Number(old.priority) : 10,
-      ...(pool === "vllm" ? { aliases: ["local"] } : {}),
       models
     };
   });
@@ -451,22 +450,28 @@ function buildFamily(role, members, priorities, serviceOf) {
   }
 
   const modelOverrides = new Map();
-  // Общая часть тегов роли — пересечение членов; различие члена сверх
-  // пересечения — его требование к тегам модельной записи (solveModelTags).
-  // Прежний код при неоднообразных тегах ронял common.tags целиком и сваливал
-  // ПОЛНЫЕ теги члена на запись — они налипали на все роли этой модели.
+  // Общая часть тегов роли — пересечение членов; она остаётся на пресете —
+  // единственном месте, где теги ещё живут. Различие члена сверх пересечения
+  // раньше переезжало на запись модели (solveModelTags); записи моделей сняты
+  // владельцем вместе с ними, поэтому надбавка пропадает — и обязана быть
+  // НАЗВАНА громко, а не стерта молча.
   const tagLists = presets.map((preset) => (Array.isArray(preset.tags) ? preset.tags : []));
   const tagsCommon = tagLists[0].filter((tag) => tagLists.every((list) => list.includes(tag)));
   if (tagsCommon.length) {
     common.tags = tagsCommon;
   }
-  const tagsDemands = new Map(
-    entries.map((member, index) => {
-      const split = splitModel(member.preset.model);
-      const extra = tagLists[index].filter((tag) => !tagsCommon.includes(tag));
-      return [`${split.provider}/${split.name}`, { extra, name: member.name }];
-    })
-  );
+  entries.forEach((member, index) => {
+    const extra = tagLists[index].filter((tag) => !tagsCommon.includes(tag));
+    if (extra.length) {
+      DECLARED.push({
+        preset: member.name,
+        field: "tags",
+        reason: `метка ${JSON.stringify(extra)} жила на записи модели — записи моделей сняты владельцем, теги остались только у пресета`,
+        was: tagLists[index],
+        now: tagsCommon
+      });
+    }
+  });
 
   // Требование роли к уровню thinking модели: у неоднообразного семейства —
   // жёсткое (иначе различие членов не переживёт схлопывания), у однообразного
@@ -500,84 +505,7 @@ function buildFamily(role, members, priorities, serviceOf) {
       preset.description = description;
     }
   }
-  return { preset, names, role, uniformThinking, thinkingDemands, tagsDemands };
-}
-
-/**
- * Разрешает tags модельных записей по требованиям всех пользователей модели.
- * Запись глобальна, а её теги ДОБАВЛЯЮТСЯ к тегам пресета, поэтому отличие
- * между ролями нельзя класть на запись без naveca на чужие имена: одиночка
- * всегда требует пустую надбавку (его теги переезжают целиком на него).
- * Требования расходятся — миграция отказывает с именами, а не выбирает
- * молча чей-то вариант.
- */
-function solveModelTags(familyPlans, singles) {
-  const demands = new Map();
-  const add = (key, demand) => {
-    if (!demands.has(key)) {
-      demands.set(key, []);
-    }
-    demands.get(key).push(demand);
-  };
-  for (const plan of familyPlans) {
-    for (const [key, demand] of plan.tagsDemands) {
-      add(key, demand);
-    }
-  }
-  for (const [name, preset] of singles) {
-    const split = splitModel(preset.model);
-    if (!split) {
-      continue;
-    }
-    add(`${split.provider}/${split.name}`, { extra: [], name });
-  }
-
-  const resolved = new Map();
-  for (const [key, list] of demands) {
-    const distinct = new Map(list.map((demand) => [JSON.stringify(demand.extra), demand]));
-    // Тег — метка, а не поведение, но налепить метку ОДНОЙ роли на всех
-    // пользователей модели нельзя: так `coverage` уехал бы на go-developer.
-    // Переезжает на модель только то, чего требует БОЛЬШИНСТВО её пользователей
-    // — такая метка описывает саму модель, а не роль (в живой конфигурации это
-    // `local`: его несут три локальные роли из пяти, а rust-варианты той же
-    // модели забыли). Меньшинство — по-прежнему отказ с именами: различие
-    // роли не выражается записью модели, и угадывать тут нечего.
-    const users = list.length;
-    const votes = new Map();
-    for (const { extra } of list) {
-      for (const tag of new Set(extra)) {
-        votes.set(tag, (votes.get(tag) ?? 0) + 1);
-      }
-    }
-    const union = [...votes.keys()].filter((tag) => votes.get(tag) * 2 > users);
-    const minority = [...votes.keys()].filter((tag) => votes.get(tag) * 2 <= users);
-    if (minority.length) {
-      const named = list
-        .filter((demand) => demand.extra.some((tag) => minority.includes(tag)))
-        .map((demand) => `${demand.name} (${JSON.stringify(demand.extra)})`)
-        .join(", ");
-      throw new Error(
-        `Model "${key}" is demanded different tag extras by ${named} — ` +
-          "one model record would paste one role's tags onto the others; reconcile the roles by hand."
-      );
-    }
-    for (const demand of list) {
-      const gained = union.filter((tag) => !demand.extra.includes(tag));
-      if (gained.length) {
-        DECLARED.push({
-          preset: demand.name,
-          field: "tags",
-          reason: `метка ${JSON.stringify(gained)} описывает модель "${key}" (её требует большинство ролей), а этой роли не стояла`,
-          was: demand.extra,
-          now: union
-        });
-      }
-    }
-    if (union.length) {
-      resolved.set(key, union);
-    }
-  }
-  return resolved;
+  return { preset, names, role, uniformThinking, thinkingDemands };
 }
 
 /**
@@ -664,17 +592,14 @@ function solveModelThinking(familyPlans, singles) {
 }
 
 /**
- * Apply the globally solved tags extras and thinking levels to the registry
- * records.
+ * Apply the globally solved thinking levels to the registry records. Tags are
+ * not among the overrides: model records no longer carry any (owner decision),
+ * tags live on the preset alone.
  */
-function applyModelOverrides(pools, tagsById, thinkingById) {
+function applyModelOverrides(pools, thinkingById) {
   for (const pool of pools) {
     for (const model of pool.models) {
       const key = `${model.provider}/${model.name}`;
-      const tags = tagsById.get(key);
-      if (tags !== undefined) {
-        model.tags = tags;
-      }
       const thinking = thinkingById.get(key);
       if (thinking !== undefined) {
         model.thinking = thinking;
@@ -774,11 +699,10 @@ export function migrateConfig(raw) {
     familyPlans.push(plan);
   }
   const thinkingById = solveModelThinking(familyPlans, singles);
-  const tagsById = solveModelTags(familyPlans, singles);
   for (const plan of familyPlans) {
     presetsOut.push(plan.preset);
   }
-  applyModelOverrides(poolsOut, tagsById, thinkingById);
+  applyModelOverrides(poolsOut, thinkingById);
 
   for (const [name, preset] of singles) {
     presetsOut.push(carrySingle(name, preset, serviceOf, poolNames));
@@ -809,8 +733,9 @@ export function migrateConfig(raw) {
 
 /**
  * Equivalence proof (T-6). For every historical preset name, resolve it in the
- * NEW config (through the pool alias — `*-local` pins `vllm`) and compare what
- * a run would actually get against the old config's answer.
+ * NEW config (the tail names the pool itself; `*-local` does not resolve
+ * anymore — its pin is derived from the old preset's own model) and compare
+ * what a run would actually get against the old config's answer.
  *
  * Returns a list of mismatch descriptions; empty means equivalent.
  */
@@ -824,13 +749,32 @@ export function verifyEquivalence(oldRaw, newRaw, declared = []) {
   const accepted = new Set(declared.map((entry) => `${entry.preset}|${entry.field}`));
 
   for (const name of Object.keys(old.presets ?? {})) {
-    const reference = resolvePresetReference(fresh, name);
+    let reference = resolvePresetReference(fresh, name);
     if (!reference) {
-      problems.push(`${name}: имя больше не разрешается в новой конфигурации (ни пресет, ни алиас пула).`);
+      // `*-local` больше не разрешается: aliases пула сняты владельцем. Сверка
+      // всё равно обязана доказать, что контур роли переехал: пин берём не из
+      // хвоста имени, а из собственной модели старого пресета.
+      const oldPreset = old.presets[name] ?? {};
+      const split = splitModel(oldPreset.model);
+      const base = Object.keys(fresh.presets ?? {}).find((id) => name.startsWith(`${id}-`));
+      const pin =
+        split &&
+        Object.values(fresh.concurrencyPools ?? {}).find((pool) =>
+          Object.values(pool.models ?? {}).some((model) => model.provider === split.provider)
+        );
+      if (base && pin) {
+        reference = { preset: fresh.presets[base], presetName: base, requestedName: name, poolPin: pin.pool };
+      }
+    }
+    if (!reference) {
+      problems.push(`${name}: имя больше не разрешается в новой конфигурации (ни пресет, ни пул).`);
       continue;
     }
     const oldSettings = resolveRunSettings(old, "delegate", { preset: name });
-    const newSettings = resolveRunSettings(fresh, "delegate", { preset: name });
+    // The new settings resolve under the NAME THE NEW CONFIG ANSWERS TO, not
+    // the requested one: `*-local` no longer resolves by design, and the pin
+    // (fallback above) already carries the old name's pool choice.
+    const newSettings = resolveRunSettings(fresh, "delegate", { preset: reference.presetName });
     const { variants } = buildVariants(reference.preset, fresh, { poolPin: reference.poolPin });
     if (!variants.length) {
       problems.push(`${name}: пресет "${reference.presetName}" не содержит моделей.`);
@@ -861,7 +805,10 @@ export function verifyEquivalence(oldRaw, newRaw, declared = []) {
       variant.thinking ?? newSettings.thinking
     );
     const tagsOf = (value) => [...(Array.isArray(value) ? value : [])].sort();
-    check("tags", tagsOf(oldSettings.tags), tagsOf([...(newSettings.tags ?? []), ...variant.tags]));
+    // Model records carry no tags anymore, so the preset's list is the whole
+    // answer; a role whose old tags exceeded the collapsed preset's common
+    // part shows up as a DECLARED divergence, not as a silent drop.
+    check("tags", tagsOf(oldSettings.tags), tagsOf(newSettings.tags));
     for (const field of [
       "systemPrompt",
       "appendSystemPrompt",
@@ -902,8 +849,8 @@ export function verifyEquivalence(oldRaw, newRaw, declared = []) {
 
     // The provider dimension moved from the profile to the pool: whatever slot
     // group the old name drew through its sandbox profile must now equal the
-    // pool of the model it resolves to (pool aliases count — `*-local` said
-    // `vllm`). Otherwise the migration rewired who counts slots.
+    // pool of the model it resolves to. Pool aliases are gone; the pool is
+    // addressed only by its own name.
     const oldSandbox = old.presets[name]?.sandbox;
     const oldSandboxProfile = profileNameOf(oldSandbox);
     if (oldSandboxProfile && old.sandboxProfiles?.[oldSandboxProfile]) {
@@ -915,7 +862,7 @@ export function verifyEquivalence(oldRaw, newRaw, declared = []) {
         const pool = Object.values(fresh.concurrencyPools ?? {}).find((entry) => entry.pool === variant.pool);
         if (!pool) {
           problems.push(`${name}: модель "${variant.model}" не входит ни в один пул новой конфигурации.`);
-        } else if (pool.pool !== group && !(pool.aliases ?? []).includes(group)) {
+        } else if (pool.pool !== group) {
           problems.push(
             `${name}: группа слотов "${group}" профиля "${oldSandbox}" не совпадает с пулом "${pool.pool}" модели "${variant.model}".`
           );

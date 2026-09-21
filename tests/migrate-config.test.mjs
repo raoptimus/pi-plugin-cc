@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { lineDiff, migrateConfig, verifyEquivalence , declaredDivergences} from "../plugins/pi/scripts/migrate-config.mjs";
+import { lineDiff, migrateConfig, verifyEquivalence, declaredDivergences } from "../plugins/pi/scripts/migrate-config.mjs";
+import { normalizeConcurrencyPool } from "../plugins/pi/scripts/lib/config.mjs";
 
 const SCRIPT = path.resolve(path.dirname(decodeURIComponent(new URL(import.meta.url).pathname)), "../plugins/pi/scripts/migrate-config.mjs");
 
@@ -154,14 +155,22 @@ test("Т-4: живая раскладка — трио схлопывается 
   assert.ok(!JSON.stringify(config).includes("concurrencyGroup"), "provider dimension removed from the whole document");
 });
 
-test("Т-5: реестр моделей с глобальными id; пул несёт limit, priority и aliases", () => {
+test("Т-5: реестр моделей с глобальными id; пул несёт limit и priority, aliases снят", () => {
   const raw = liveFleet();
   const { config } = migrateConfig(raw);
   const pools = Object.fromEntries(config.concurrencyPools.map((pool) => [pool.pool, pool]));
   assert.equal(pools.zai.limit, 7);
   assert.equal(pools.deepseek.limit, 7);
   assert.equal(pools.vllm.limit, 1);
-  assert.deepEqual(pools.vllm.aliases, ["local"]);
+  // aliases сняты владельцем: пул адресуется только собственным именем.
+  for (const pool of config.concurrencyPools) {
+    assert.equal(pool.aliases, undefined, `pool ${pool.pool} carries no aliases`);
+  }
+  // aliases во входной конфигурации — внятный отказ, не молчаливый приём.
+  assert.throws(
+    () => normalizeConcurrencyPool({ limit: 1, aliases: ["local"] }, "vllm"),
+    /removed "aliases".*address the pool as it is named/
+  );
   for (const pool of config.concurrencyPools) {
     assert.equal(pool.priority, 10);
     for (const model of pool.models) {
@@ -337,12 +346,13 @@ test("фикс: группа слотов каждого старого имен
     `pool rewiring must be refused, got: ${problems.join(" | ")}`
   );
 
-  // То же на стороне РЕЗУЛЬТАТА: кто-то испортил выходной пул — сверка ловит.
+  // То же на стороне РЕЗУЛЬТАТА: кто-то переименовал выходной пул — у
+  // go-developer-local группа слотов перестала совпадать, сверка ловит.
   const corrupted = JSON.parse(JSON.stringify(config));
   const vllm = corrupted.concurrencyPools.find((pool) => pool.pool === "vllm");
-  vllm.aliases = [];
+  vllm.pool = "vllmx";
   assert.ok(verifyEquivalence(raw, corrupted).some((line) => line.includes("go-developer-local")),
-    "breaking the pool alias must be caught for the *-local name");
+    "breaking the pool name must be caught for the *-local name");
 });
 
 // Фикс-раунд 2: собственный env роли из объектной песочницы.
@@ -367,46 +377,43 @@ test("фикс-раунд 2: теги остаются у роли, записи
   );
 });
 
-test("надбавка к тегам от МЕНЬШИНСТВА пользователей модели — отказ с именами, не тихий выбор", () => {
+test("надбавка к тегам роли не переезжает на запись модели — запись снимается, надбавка названа громко", () => {
   const raw = liveFleet();
   // Роль просит на свою deepseek-модель тег, которого нет у остальных её
-  // пользователей: запись модели одна, и такой тег уехал бы на чужие роли.
-  raw.presets["python-developer-deepseek"].tags = ["dev", "python", "coverage"];
-  assert.throws(
-    () => migrateConfig(raw),
-    (error) => {
-      assert.match(error.message, /Model "deepseek\/deepseek-v4-flash" is demanded different tag extras/);
-      assert.match(error.message, /python-developer-deepseek/);
-      return true;
-    }
+  // пользователей. Записей моделей больше нет, теги живут только у пресета:
+  // миграция НЕ отказывает и НЕ выбирает молча — надбавка пропадает, но её
+  // исчезновение названо в DECLARED по паре «пресет + поле».
+  raw.presets["python-developer-deepseek"].tags = ["dev", "py", "coverage"];
+  const migrated = migrateConfig(raw);
+  assert.deepEqual(migrated.config, migrated.config, "migration converges");
+  const flatModels = migrated.config.concurrencyPools.flatMap((pool) => pool.models);
+  assert.ok(flatModels.every((model) => model.tags === undefined), "no tag lands on a model record");
+  const declared = declaredDivergences().filter((entry) => entry.field === "tags");
+  assert.ok(
+    declared.some((entry) => entry.preset === "python-developer-deepseek" && entry.was.includes("coverage")),
+    `the lost tag extra must be named loudly: ${JSON.stringify(declared)}`
   );
+  // Сверка принимает пропажу ровно по названной паре и ловит всё остальное.
+  assert.deepEqual(verifyEquivalence(raw, migrated.config, declaredDivergences()), []);
 });
 
-test("надбавка от БОЛЬШИНСТВА пользователей модели переезжает на модель, и различие названо громко", () => {
+test("общая часть тегов роли остаётся у пресета; у *-local она не шире общей — различие названо", () => {
   const raw = liveFleet();
-  // Метка, которую несёт большинство пользователей модели, описывает саму
-  // модель: в живой конфигурации `local` стоит у трёх локальных ролей из пяти,
-  // а rust-варианты той же модели её забыли. Фикстура такой расклад не несёт —
-  // выставляем его явно, чтобы кейс проверял ПРАВИЛО, а не содержимое фикстуры.
-  const localUsers = Object.entries(raw.presets)
-    .filter(([, preset]) => String(preset.model).startsWith("vllm/"))
-    .map(([name]) => name);
-  assert.ok(localUsers.length >= 3, `фикстуре нужны минимум три пользователя локальной модели: ${localUsers}`);
-  for (const name of localUsers.slice(0, localUsers.length - 1)) {
-    raw.presets[name].tags = [...(raw.presets[name].tags ?? []), "local"];
-  }
-  const forgotten = localUsers[localUsers.length - 1];
-  raw.presets[forgotten].tags = (raw.presets[forgotten].tags ?? []).filter((tag) => tag !== "local");
-  const migrated = migrateConfig(raw);
-  const vllm = migrated.config.concurrencyPools.find((entry) => entry.pool === "vllm");
-  const model = vllm.models.find((entry) => entry.name === "Qwen3.8-27B");
-  assert.deepEqual(model.tags, ["local"], "метка большинства стоит на записи модели");
+  // Метка `local` у локального члена семейства описывала модель; записи
+  // моделей сняты владельцем, поэтому надбавка исчезает — и это названо
+  // громко, по имени пресета, а не стёрто молча.
+  // Надбавка к общей части в фикстуре не живёт — выставляем её явно, чтобы
+  // кейс проверял ПРАВИЛО, а не содержимое фикстуры.
+  raw.presets["go-developer-local"].tags = ["dev", "go", "local"];
+  const { config } = migrateConfig(raw);
+  const byId = Object.fromEntries(config.presets.map((preset) => [preset.id, preset]));
+  assert.deepEqual(byId["go-developer"].tags, ["dev", "go"], "the common part stays on the preset");
   const declared = declaredDivergences().filter((entry) => entry.field === "tags");
-  assert.ok(declared.length > 0, "роль, получившая метку, обязана быть названа, а не изменена молча");
   assert.ok(
-    declared.some((entry) => entry.preset === forgotten && entry.now.includes("local")),
-    `роль без метки обязана быть названа: ${JSON.stringify(declared.map((e) => e.preset))}`
+    declared.some((entry) => entry.preset === "go-developer-local" && JSON.stringify(entry.now).includes("dev")),
+    `the *-local tag drop must be named: ${JSON.stringify(declared.map((e) => e.preset))}`
   );
+  assert.deepEqual(verifyEquivalence(raw, config, declaredDivergences()), []);
 });
 
 test("фикс-раунд 2: thinking одиночки берётся из него самого, конфликт записи решается в пользу роли", () => {

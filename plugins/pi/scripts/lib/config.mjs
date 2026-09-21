@@ -46,7 +46,7 @@ const BUILT_IN = {
   // Named slot pools: `{"ollama-pro": 3}` means every profile that declares
   // `"concurrencyGroup": "ollama-pro"` draws from the same three slots. Optional
   // — a profile can also cap itself with `maxConcurrent` and share nothing.
-  // A pool may also be a full object: `{limit, priority, aliases, models}` —
+  // A pool may also be a full object: `{limit, priority, models}` —
   // the models being an array of records `{id, provider, name,
   // samplingParams?, thinking?, tags?}` with globally unique ids, so a preset
   // lists model ids instead of restating model/thinking per provider. The pool
@@ -252,8 +252,7 @@ export function normalizeConfigLayer(layer) {
  *
  * The historical shape is a bare number of slots; it still reads as `{limit}`.
  * A full pool object carries the same limit, a `priority` (smaller runs
- * earlier), optional `aliases` (presets are called `*-local` while the pool is
- * `vllm`), and the model registry under `models` — an array of records keyed
+ * earlier) and the model registry under `models` — an array of records keyed
  * by their globally unique `id`.
  */
 export function normalizeConcurrencyPool(value, name = "pool") {
@@ -268,6 +267,13 @@ export function normalizeConcurrencyPool(value, name = "pool") {
   const limit = Number(value.limit);
   if (!Number.isFinite(limit) || limit <= 0) {
     throw new Error(`Concurrency pool "${name}" needs a positive "limit", got ${JSON.stringify(value.limit ?? null)}.`);
+  }
+  if (value.aliases !== undefined) {
+    refuseRemovedField(
+      `Pool "${name}"`,
+      "aliases",
+      'A preset is pinned by the pool\'s own name ("<role>-vllm"); `*-local` spellings are gone — address the pool as it is named.'
+    );
   }
   if (value.default !== undefined) {
     refuseRemovedField(
@@ -319,9 +325,10 @@ export function resolvePresetReference(config, name) {
   }
   // Pool names may contain dashes themselves, so the split point is not the
   // last dash: match "<preset>-<tail>" against what the role's model list
-  // implies. The tail may name a pool, one of its aliases (presets are called
-  // `*-local` while the pool is `vllm`), or a model id of the preset — the
-  // pinned pool is whichever of the three answers.
+  // implies. The tail names the pool itself (`go-developer-zai` → pool `zai`)
+  // or a model id of the preset — the pinned pool is whichever of the two
+  // answers. Pool `aliases` are gone: one pool answered to two names, and the
+  // `*-local` spelling died with them.
   const pools = config.concurrencyPools ?? {};
   for (const [base, preset] of Object.entries(presets)) {
     if (!preset || !Array.isArray(preset.models) || !name.startsWith(`${base}-`)) {
@@ -331,13 +338,6 @@ export function resolvePresetReference(config, name) {
     let pin = null;
     if (pools[tail] != null) {
       pin = tail;
-    } else {
-      for (const [poolName, pool] of Object.entries(pools)) {
-        if (Array.isArray(pool?.aliases) && pool.aliases.map(String).includes(tail)) {
-          pin = poolName;
-          break;
-        }
-      }
     }
     if (!pin && preset.models.includes(tail)) {
       pin = poolOfModel(pools, tail);

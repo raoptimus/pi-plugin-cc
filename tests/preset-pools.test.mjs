@@ -562,20 +562,16 @@ test("the chosen model's thinking and tags win over the preset's", async () => {
   assert.equal(flagged.thinkingFromFlag, true, "a flag outranks the model record");
 });
 
-test("the old <role>-<pool> names resolve through pool, alias, or model id", async () => {
+test("the old <role>-<pool> names resolve through pool or model id; <role>-local is refused", async () => {
   const { resolveRunSettings } = await import("../plugins/pi/scripts/lib/config.mjs");
   const { buildVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
-  const config = normalizeConfigLayer(ownerFormConfig({ aliases: ["local"] }));
+  const config = normalizeConfigLayer(ownerFormConfig());
   config.presets.role.systemPrompt = "reviewer";
 
   const byPool = resolveRunSettings(config, "delegate", { preset: `role-beta-${UNIQUE}` });
-  assert.equal(byPool.presetName, "role", "the alias resolves onto the role preset");
+  assert.equal(byPool.presetName, "role", "the pool pin resolves onto the role preset");
   assert.equal(byPool.presetPool, `beta-${UNIQUE}`);
   assert.equal(byPool.requestedPresetName, `role-beta-${UNIQUE}`, "the request keeps the name that was asked for");
-
-  // Presets are called *-local, the pool is called beta: the alias bridges.
-  const byAlias = resolveRunSettings(config, "delegate", { preset: "role-local" });
-  assert.equal(byAlias.presetPool, `alpha-${UNIQUE}`, "the alias names the vllm-style pool, not a pool called local");
 
   // A tail naming a model id pins that model's pool.
   const byModel = resolveRunSettings(config, "delegate", { preset: `role-other-${UNIQUE}` });
@@ -583,10 +579,27 @@ test("the old <role>-<pool> names resolve through pool, alias, or model id", asy
 
   const pinned = buildVariants(config.presets.role, config, { poolPin: `beta-${UNIQUE}` });
   assert.deepEqual(pinned.variants.map((variant) => variant.pool), [`beta-${UNIQUE}`]);
+
+  // Pool aliases are gone (owner decision): the `*-local` spelling does not
+  // resolve, and the refusal names what IS available rather than guessing.
+  assert.throws(
+    () => resolveRunSettings(config, "delegate", { preset: "role-local" }),
+    (error) => {
+      assert.match(error.message, /Unknown preset "role-local"/);
+      assert.match(error.message, new RegExp(`Available presets: role`));
+      return true;
+    },
+    "the *-local spelling must be refused with the available list"
+  );
   assert.throws(
     () => resolveRunSettings(config, "delegate", { preset: "role-ghost" }),
     /Unknown preset/,
     "an unmatched tail is a refusal, not a silent fall-back to the first model"
+  );
+  // And the field itself does not come back: a pool with aliases is refused.
+  assert.throws(
+    () => normalizeConfigLayer({ concurrencyPools: [{ pool: `p-${UNIQUE}`, limit: 1, aliases: ["local"] }] }),
+    /removed "aliases"/
   );
 });
 
@@ -689,7 +702,6 @@ test("the slot-time pick keeps the developed sandbox and moves only model-choice
     provider: "prov",
     model: "prov/smart-model",
     thinking: "low",
-    tags: ["model-tag"],
     samplingParams: { max_tokens: 4096 },
     sandbox: { concurrencyGroup: `beta-${UNIQUE}`, maxConcurrent: 2, heldSlot: { waitedMs: 5, release: () => {} } }
   });
@@ -709,13 +721,14 @@ test("the slot-time pick keeps the developed sandbox and moves only model-choice
   assert.equal(settings.model, "prov/smart-model");
   assert.equal(settings.provider, "prov");
   assert.equal(settings.thinking, "low", "the model record's thinking overrides the preset's");
-  assert.deepEqual(settings.tags, ["role-tag", "model-tag"]);
+  // Model records carry no tags anymore: the preset's list is the whole answer.
+  assert.deepEqual(settings.tags, ["role-tag"]);
 });
 
 // Т-8, финальная клауза: выбор варианта обязан положить в settings provider,
-// model, thinking, tags и samplingParams ВЫБРАННОЙ модели — иначе прогон уезжает
+// model, thinking и samplingParams ВЫБРАННОЙ модели — иначе прогон уезжает
 // с thinking/потолком первой же записи, которую пропустили.
-test("the slot pick fills settings with the CHOSEN model's provider, model, thinking, tags and samplingParams", async () => {
+test("the slot pick fills settings with the CHOSEN model's provider, model, thinking and samplingParams", async () => {
   const { buildVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
   const { awaitSandboxSlot, awaitVariantSlot } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
   const { resolveRunSettings } = await import("../plugins/pi/scripts/lib/config.mjs");
@@ -729,13 +742,11 @@ test("the slot pick fills settings with the CHOSEN model's provider, model, thin
   alpha[`fast-${UNIQUE}`] = {
     ...alpha[`fast-${UNIQUE}`],
     thinking: "off",
-    tags: [`fast-tag-${UNIQUE}`],
     samplingParams: { temperature: 1, max_tokens: 111 }
   };
   config.concurrencyPools[`beta-${UNIQUE}`].models[`other-${UNIQUE}`] = {
     ...config.concurrencyPools[`beta-${UNIQUE}`].models[`other-${UNIQUE}`],
     thinking: "low",
-    tags: [`smart-tag-${UNIQUE}`],
     samplingParams: { temperature: 0.5, max_tokens: 222 }
   };
 
@@ -759,18 +770,17 @@ test("the slot pick fills settings with the CHOSEN model's provider, model, thin
   assert.equal(settings.provider, "prov2");
   assert.equal(settings.model, "prov2/other-model");
   assert.equal(settings.thinking, "low", "the chosen model's thinking, not the first's (off) or the preset's (high)");
-  assert.ok(settings.tags.includes(`smart-tag-${UNIQUE}`) && settings.tags.includes("role-tag"), JSON.stringify(settings.tags));
-  assert.ok(!settings.tags.includes(`fast-tag-${UNIQUE}`), "the skipped model's tags did not leak in");
+  assert.deepEqual(settings.tags, ["role-tag"], "the preset's tags are the whole answer; model records carry none");
   assert.deepEqual(settings.sandbox.samplingParams, { temperature: 0.5, max_tokens: 222 }, "the chosen model's sampling params, not the first's");
 });
 
-// Т-9: теги записи модели доезжают до settings даже без тегов пресета —
-// ассерт «список непустой» этот случай не ловит, нужен точный состав.
-test("a model's own tags land in settings even when the preset names none", async () => {
-  const { buildVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
+// Теги записи модели сняты владельцем: единственный потребитель читал теги
+// пресета, поэтому запись с тегами не должна прокинуть их ни в вариант,
+// ни в settings — даже когда пресет своих тегов не называет.
+test("a model record's tags do not reach the variant or settings", async () => {
+  const { buildVariants, applyPickedVariant } = await import("../plugins/pi/scripts/pi-companion.mjs");
   const { awaitVariantSlot } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
   const { resolveRunSettings } = await import("../plugins/pi/scripts/lib/config.mjs");
-  const { applyPickedVariant } = await import("../plugins/pi/scripts/pi-companion.mjs");
 
   const config = normalizeConfigLayer(ownerFormConfig());
   config.concurrencyPools[`beta-${UNIQUE}`].models[`other-${UNIQUE}`].tags = [`model-only-${UNIQUE}`];
@@ -784,11 +794,11 @@ test("a model's own tags land in settings even when the preset names none", asyn
   applyPickedVariant(settings, picked);
   picked.release();
 
-  assert.deepEqual(settings.tags, [`model-only-${UNIQUE}`], "the model record's tags are the whole answer");
+  assert.deepEqual(settings.tags, [], "the model record's tags are not the answer anymore");
   assert.equal(
-    variantById(buildVariants(config.presets.role, config).variants, `other-${UNIQUE}`).tags.length,
-    1,
-    "the variant itself carries the model's tags"
+    variantById(buildVariants(config.presets.role, config).variants, `other-${UNIQUE}`).tags,
+    undefined,
+    "the variant itself carries no tags"
   );
 });
 
