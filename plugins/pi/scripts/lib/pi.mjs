@@ -533,7 +533,7 @@ function proxyProviderOf(sandbox) {
   return sandbox?.provider ?? "unknown";
 }
 
-async function openCredentialProxy(sandbox, onProgress, model, jobId = null) {
+export async function openCredentialProxy(sandbox, onProgress, model, jobId = null) {
   // `proxyCredentials: false` in a profile opts out — for a provider whose
   // endpoint does something the plain forwarder here does not reproduce.
   if (!isSandboxed(sandbox) || !sandbox.auth || !sandbox.provider || sandbox.proxyCredentials === false) {

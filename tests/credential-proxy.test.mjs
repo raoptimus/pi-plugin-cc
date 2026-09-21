@@ -896,3 +896,51 @@ test("Google's spelling of the finish reason is read, and read raw", async () =>
   whole.finishNonStream(JSON.stringify({ candidates: [{ finishReason: "MAX_TOKENS" }] }));
   assert.equal(whole.summary().finish_reason, "MAX_TOKENS");
 });
+
+// The delivery seam, not the proxy itself: each engine carries its own copy of
+// openCredentialProxy, which must hand `sandbox.samplingParams` to
+// startCredentialProxy. Losing that line used to be invisible — the direct
+// startCredentialProxy tests kept passing.
+test("both engines deliver sandbox.samplingParams to the credential proxy", async (t) => {
+  const upstream = await startUpstream();
+  const home = homeWithSampling(upstream.port, { max_tokens: 555 });
+  const agentDir = path.join(home, ".pi", "agent");
+  fs.writeFileSync(
+    path.join(agentDir, "auth.json"),
+    JSON.stringify({ "test-provider": { type: "api", key: "REAL-SECRET-KEY" } })
+  );
+  const realHome = process.env.HOME;
+  process.env.HOME = home;
+  t.after(() => {
+    process.env.HOME = realHome;
+    upstream.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  const sandbox = {
+    mode: "docker",
+    image: "busybox:latest",
+    auth: true,
+    provider: "test-provider",
+    samplingParams: { max_tokens: 123456 }
+  };
+  const { openCredentialProxy: viaRpc } = await import("../plugins/pi/scripts/lib/rpc.mjs");
+  const { openCredentialProxy: viaPi } = await import("../plugins/pi/scripts/lib/pi.mjs");
+
+  for (const [engine, open] of [["rpc", viaRpc], ["one-shot pi", viaPi]]) {
+    const proxy = await open(sandbox, null, "test-provider/real-model-v2");
+    assert.ok(proxy, `${engine}: the proxy opens`);
+    const local = proxy.url.replace("host.docker.internal", "127.0.0.1");
+    try {
+      await fetch(`${local}/chat/completions`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${proxy.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ model: "agent-model", messages: [{ role: "user", content: "hi" }] })
+      });
+      const sent = JSON.parse(upstream.seen[upstream.seen.length - 1].body);
+      assert.equal(sent.max_tokens, 123456, `${engine}: the sandbox's ceiling is on the wire, not the registry's 555`);
+    } finally {
+      await proxy.close();
+    }
+  }
+});
