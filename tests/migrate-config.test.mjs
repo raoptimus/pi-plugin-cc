@@ -29,14 +29,16 @@ function liveFleet() {
     timeoutMs: 1_800_000,
     git: { name: "Fleet", email: "fleet@example.com" },
     skills: ["/pi-skills/vision"],
-    tags: ["fleet"],
     ...extra
   });
-  const family = (role, zaiProfile, qa = false) => ({
-    [`${role}-zai`]: member("zai-coding-cn/glm-5.3-flash", "low", sb(role, zaiProfile, qa), { description: `${role} (zai)` }),
-    [`${role}-deepseek`]: member("deepseek/deepseek-v4-flash", "low", sb(role, "agent-deepseek", qa), { description: `${role} (deepseek)` }),
-    [`${role}-local`]: member("vllm/Qwen3.8-27B", "off", sb(role, "agent-dind-vllm", qa), { description: `${role} (local)` })
-  });
+  const family = (role, zaiProfile, qa = false) => {
+    const tags = [qa ? "qa" : "dev", role.split("-")[0]];
+    return {
+    [`${role}-zai`]: member("zai-coding-cn/glm-5.3-flash", "low", sb(role, zaiProfile, qa), { tags, description: `${role} (zai)` }),
+    [`${role}-deepseek`]: member("deepseek/deepseek-v4-flash", "low", sb(role, "agent-deepseek", qa), { tags, description: `${role} (deepseek)` }),
+    [`${role}-local`]: member("vllm/Qwen3.8-27B", "off", sb(role, "agent-dind-vllm", qa), { tags, description: `${role} (local)` })
+    };
+  };
   const dind = { args: ["--security-opt", "seccomp=@dind.json", "--device", "/dev/net/tun"], env: ["PI_DIND=1"], mounts: ["pi-dind:/var/lib/docker"] };
   // The owner's live layout (checked against the real file): the trio
   // agent-dind / agent-dind-vllm / agent-deepseek is byte-identical over
@@ -56,22 +58,23 @@ function liveFleet() {
       ...family("go-developer", "agent-dind"),
       ...family("go-qa", "agent-dind", true),
       ...family("python-developer", "agent-dind"),
-      "python-qa-zai": member("zai-coding-cn/glm-5.3-flash", "low", sb("python-qa", "agent", true), { systemPrompt: "@qa" }),
-      "python-qa-local": member("vllm/Qwen3.8-27B", "off", sb("python-qa", "agent-dind-vllm", true), { systemPrompt: "@qa" }),
+      "python-qa-zai": member("zai-coding-cn/glm-5.3-flash", "low", sb("python-qa", "agent", true), { tags: ["qa", "py"], systemPrompt: "@qa" }),
+      "python-qa-local": member("vllm/Qwen3.8-27B", "off", sb("python-qa", "agent-dind-vllm", true), { tags: ["qa", "py"], systemPrompt: "@qa" }),
       ...family("web-developer", "agent"),
-      "web-qa-local": member("vllm/Qwen3.8-27B", "off", sb("web-qa", "agent-dind-vllm", true), { systemPrompt: "@qa" }),
-      "rust-developer-local": member("vllm/Qwen3.8-27B", "off", sb("rust-developer", "agent-dind-vllm"), { systemPrompt: "@dev-rust" }),
-      "rust-qa-local": member("vllm/Qwen3.8-27B", "off", sb("rust-qa", "agent-dind-vllm", true), { systemPrompt: "@qa-rust" }),
+      "web-qa-local": member("vllm/Qwen3.8-27B", "off", sb("web-qa", "agent-dind-vllm", true), { tags: ["qa", "web"], systemPrompt: "@qa" }),
+      "rust-developer-local": member("vllm/Qwen3.8-27B", "off", sb("rust-developer", "agent-dind-vllm"), { tags: ["dev", "rust"], systemPrompt: "@dev-rust" }),
+      "rust-qa-local": member("vllm/Qwen3.8-27B", "off", sb("rust-qa", "agent-dind-vllm", true), { tags: ["qa", "rust"], systemPrompt: "@qa-rust" }),
       reviewer: {
         model: "zai-coding-cn/glm-5.3",
         thinking: "high",
         readOnly: true,
+        tags: ["review"],
         sandbox: sb("reviewer", "agent"),
         systemPrompt: "reviewer",
         description: "Ревьюер"
       },
-      researcher: { model: "zai-coding-cn/glm-5.3-flash", thinking: "high", sandbox: sb("researcher", "agent"), systemPrompt: "@research" },
-      "coverage-auditor": { model: "deepseek/deepseek-v4-flash", thinking: "high", sandbox: sb("coverage-auditor", "agent-deepseek"), systemPrompt: "@coverage" },
+      researcher: { model: "zai-coding-cn/glm-5.3-flash", thinking: "high", tags: ["research"], sandbox: sb("researcher", "agent"), systemPrompt: "@research" },
+      "coverage-auditor": { model: "deepseek/deepseek-v4-flash", thinking: "high", tags: ["audit", "blind"], sandbox: sb("coverage-auditor", "agent-deepseek"), systemPrompt: "@coverage" },
     },
     gitProxy: { "github.com": {} }
   };
@@ -96,7 +99,7 @@ test("Т-2: семейство схлопывается в один пресет
   // поверх сервиса; сам сервис — "agent".
   assert.equal(go.sandbox.profile, "agent");
   assert.equal(go.systemPrompt, "@dev");
-  assert.deepEqual(go.tags, ["fleet"]);
+  assert.deepEqual(go.tags, ["dev", "go"]);
   // Различавшиеся thinking — на записях моделей. С решателем по всем
   // пользователям модели: flash нужна семействам на low, researcher — на high;
   // конфликт не кладётся на запись — семейство переносит low на пресет.
@@ -299,6 +302,41 @@ test("фикс: группа слотов каждого старого имен
 // Фикс-раунд 2: собственный env роли из объектной песочницы.
 
 // Фикс-раунд 2: thinking одиночек не затекает из модельной записи.
+
+// Фикс-раунд 2: теги ролей не перемешиваются через модельные записи.
+
+test("фикс-раунд 2: теги остаются у роли, записи их не налипают на чужие имена и не дублируются", () => {
+  const raw = liveFleet();
+  const { config } = migrateConfig(raw);
+  assert.deepEqual(verifyEquivalence(raw, config), []);
+  const byId = Object.fromEntries(config.presets.map((preset) => [preset.id, preset]));
+  assert.deepEqual(byId["python-qa"].tags, ["qa", "py"]);
+  assert.deepEqual(byId["go-developer"].tags, ["dev", "go"]);
+  assert.deepEqual(byId.researcher.tags, ["research"]);
+  assert.deepEqual(byId["coverage-auditor"].tags, ["audit", "blind"]);
+  const flatModels = config.concurrencyPools.flatMap((pool) => pool.models);
+  assert.ok(
+    flatModels.every((model) => model.tags === undefined),
+    "no role tag may leak onto a globally shared model record"
+  );
+});
+
+test("фикс-раунд 2: разные надбавки к тегам одной модели с разных ролей — отказ с именами, не выбор молча", () => {
+  const raw = liveFleet();
+  // python-developer: deepseek-член несёт роль ещё и тег "coverage" — это
+  // различие внутри семейства, оно просится на запись deepseek-модели, которой
+  // пользуются и другие роли без этой надбавки.
+  raw.presets["python-developer-deepseek"].tags = ["dev", "python", "coverage"];
+  assert.throws(
+    () => migrateConfig(raw),
+    (error) => {
+      assert.match(error.message, /Model "deepseek\/deepseek-v4-flash" is demanded different tag extras/);
+      assert.match(error.message, /python-developer-deepseek/);
+      assert.match(error.message, /go-developer-deepseek|coverage-auditor/);
+      return true;
+    }
+  );
+});
 
 test("фикс-раунд 2: thinking одиночки берётся из него самого, конфликт записи решается в пользу роли", () => {
   const raw = liveFleet();

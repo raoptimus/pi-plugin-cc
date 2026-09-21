@@ -393,33 +393,22 @@ function buildFamily(role, members, priorities, serviceOf) {
   }
 
   const modelOverrides = new Map();
-  const perModelKeys = ["tags"].filter((key) => !sameForAll(key));
-  entries.forEach((member, index) => {
-    const split = splitModel(member.preset.model);
-    if (!split) {
-      throw new Error(`Preset "${member.name}" has no usable "provider/model" string.`);
-    }
-    const key = `${split.provider}/${split.name}`;
-    const override = {};
-    for (const field of perModelKeys) {
-      const value = member.preset[field];
-      if (value === undefined) {
-        continue;
-      }
-      if (field === "tags") {
-        const presetTags = Array.isArray(common.tags) ? common.tags : [];
-        const extra = value.filter((tag) => !presetTags.includes(tag));
-        if (extra.length) {
-          override.tags = extra;
-        }
-      } else {
-        override[field] = value;
-      }
-    }
-    if (Object.keys(override).length) {
-      modelOverrides.set(key, override);
-    }
-  });
+  // Общая часть тегов роли — пересечение членов; различие члена сверх
+  // пересечения — его требование к тегам модельной записи (solveModelTags).
+  // Прежний код при неоднообразных тегах ронял common.tags целиком и сваливал
+  // ПОЛНЫЕ теги члена на запись — они налипали на все роли этой модели.
+  const tagLists = presets.map((preset) => (Array.isArray(preset.tags) ? preset.tags : []));
+  const tagsCommon = tagLists[0].filter((tag) => tagLists.every((list) => list.includes(tag)));
+  if (tagsCommon.length) {
+    common.tags = tagsCommon;
+  }
+  const tagsDemands = new Map(
+    entries.map((member, index) => {
+      const split = splitModel(member.preset.model);
+      const extra = tagLists[index].filter((tag) => !tagsCommon.includes(tag));
+      return [`${split.provider}/${split.name}`, { extra, name: member.name }];
+    })
+  );
 
   // Требование роли к уровню thinking модели: у неоднообразного семейства —
   // жёсткое (иначе различие членов не переживёт схлопывания), у однообразного
@@ -453,7 +442,54 @@ function buildFamily(role, members, priorities, serviceOf) {
       preset.description = description;
     }
   }
-  return { preset, modelOverrides, names, role, uniformThinking, thinkingDemands };
+  return { preset, names, role, uniformThinking, thinkingDemands, tagsDemands };
+}
+
+/**
+ * Разрешает tags модельных записей по требованиям всех пользователей модели.
+ * Запись глобальна, а её теги ДОБАВЛЯЮТСЯ к тегам пресета, поэтому отличие
+ * между ролями нельзя класть на запись без naveca на чужие имена: одиночка
+ * всегда требует пустую надбавку (его теги переезжают целиком на него).
+ * Требования расходятся — миграция отказывает с именами, а не выбирает
+ * молча чей-то вариант.
+ */
+function solveModelTags(familyPlans, singles) {
+  const demands = new Map();
+  const add = (key, demand) => {
+    if (!demands.has(key)) {
+      demands.set(key, []);
+    }
+    demands.get(key).push(demand);
+  };
+  for (const plan of familyPlans) {
+    for (const [key, demand] of plan.tagsDemands) {
+      add(key, demand);
+    }
+  }
+  for (const [name, preset] of singles) {
+    const split = splitModel(preset.model);
+    if (!split) {
+      continue;
+    }
+    add(`${split.provider}/${split.name}`, { extra: [], name });
+  }
+
+  const resolved = new Map();
+  for (const [key, list] of demands) {
+    const distinct = new Map(list.map((demand) => [JSON.stringify(demand.extra), demand]));
+    if (distinct.size > 1) {
+      const named = list.map((demand) => `${demand.name} (${JSON.stringify(demand.extra)})`).join(", ");
+      throw new Error(
+        `Model "${key}" is demanded different tag extras by ${named} — ` +
+          "one model record would paste one role's tags onto the others; reconcile the roles by hand."
+      );
+    }
+    const [{ extra }] = distinct.values();
+    if (extra.length) {
+      resolved.set(key, extra);
+    }
+  }
+  return resolved;
 }
 
 /**
@@ -540,16 +576,16 @@ function solveModelThinking(familyPlans, singles) {
 }
 
 /**
- * Apply the model-record overrides (tags) and the globally solved thinking
- * levels to the registry records.
+ * Apply the globally solved tags extras and thinking levels to the registry
+ * records.
  */
-function applyModelOverrides(pools, overrides, thinkingById) {
+function applyModelOverrides(pools, tagsById, thinkingById) {
   for (const pool of pools) {
     for (const model of pool.models) {
       const key = `${model.provider}/${model.name}`;
-      const extra = overrides.get(key);
-      if (extra?.tags !== undefined) {
-        model.tags = extra.tags;
+      const tags = tagsById.get(key);
+      if (tags !== undefined) {
+        model.tags = tags;
       }
       const thinking = thinkingById.get(key);
       if (thinking !== undefined) {
@@ -630,20 +666,17 @@ export function migrateConfig(raw) {
     }
   }
   const presetsOut = [];
-  const overrides = new Map();
   const familyPlans = [];
   for (const [role, members] of families) {
     const plan = buildFamily(role, members, priorities, serviceOf);
     familyPlans.push(plan);
-    for (const [key, value] of plan.modelOverrides) {
-      overrides.set(key, value);
-    }
   }
   const thinkingById = solveModelThinking(familyPlans, singles);
+  const tagsById = solveModelTags(familyPlans, singles);
   for (const plan of familyPlans) {
     presetsOut.push(plan.preset);
   }
-  applyModelOverrides(poolsOut, overrides, thinkingById);
+  applyModelOverrides(poolsOut, tagsById, thinkingById);
 
   for (const [name, preset] of singles) {
     presetsOut.push(carrySingle(name, preset, serviceOf, poolNames));
