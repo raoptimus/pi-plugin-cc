@@ -304,6 +304,56 @@ test("a project layer with one pool does not wipe the user's pools, and cannot p
   assert.equal(merged.sandboxProfiles.sneaky.args, undefined);
 });
 
+test("a project layer cannot set samplingParams on any sandbox, nor tune pool waits and cooldowns", async () => {
+  const { sanitizeProjectLayer, BUILT_IN_CONFIG, mergeConfigLayer } = await import(
+    "../plugins/pi/scripts/lib/config.mjs"
+  );
+
+  // samplingParams travels from the resolved sandbox into every paid request
+  // body, so each of the three places a project layer could inject it is its
+  // own attack path and gets its own case.
+  const paths = [
+    ["preset", { presets: { [`p-${UNIQUE}`]: { model: "m", sandbox: { profile: "s", samplingParams: { max_tokens: 1000000 } } } } }],
+    ["defaults.sandbox", { defaults: { sandbox: { samplingParams: { max_tokens: 1000000 } } } }],
+    ["user profile override", { sandboxProfiles: { [`svc-${UNIQUE}`]: { image: "img", samplingParams: { max_tokens: 1000000 } } } }]
+  ];
+  for (const [name, layer] of paths) {
+    const warnings = [];
+    const clean = sanitizeProjectLayer(normalizeConfigLayer(layer), warnings);
+    const merged = mergeConfigLayer(BUILT_IN_CONFIG, clean);
+    assert.ok(
+      warnings.some((line) => line.includes("samplingParams ignored")),
+      `${name}: warned, got ${JSON.stringify(warnings)}`
+    );
+    const sandboxes = [
+      ...Object.values(clean.presets ?? {}).map((p) => p.sandbox),
+      clean.defaults?.sandbox,
+      ...Object.values(clean.sandboxProfiles ?? {})
+    ];
+    for (const s of sandboxes) {
+      if (s && typeof s === "object") assert.equal(s.samplingParams, undefined, name);
+    }
+    assert.ok(merged, "merged without throwing");
+  }
+
+  // Pool timing knobs are top-level, not sandbox keys, but the project layer
+  // feeds them into mergeConfigLayer all the same: shortening a cooldown keeps
+  // re-hitting a provider the owner wrote off as dead.
+  const warnings = [];
+  const clean = sanitizeProjectLayer(
+    normalizeConfigLayer({ poolWaitMs: 1, poolCooldownBalanceMs: 1, poolCooldownQuotaMs: 1, poolCooldownNetworkMs: 1 }),
+    warnings
+  );
+  const mergedTiming = mergeConfigLayer(BUILT_IN_CONFIG, clean);
+  assert.equal(mergedTiming.poolWaitMs, 30_000, "the owner's wait survives");
+  assert.equal(mergedTiming.poolCooldownBalanceMs, 3_600_000);
+  assert.equal(mergedTiming.poolCooldownQuotaMs, 86_400_000);
+  assert.equal(mergedTiming.poolCooldownNetworkMs, 30_000);
+  for (const key of ["poolWaitMs", "poolCooldownBalanceMs", "poolCooldownQuotaMs", "poolCooldownNetworkMs"]) {
+    assert.ok(warnings.some((line) => line.startsWith(`${key} ignored`)), JSON.stringify(warnings));
+  }
+});
+
 test("an unknown model id or service is refused with what is known, and provider/name gets a hint", async () => {
   const { buildVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
   const config = normalizeConfigLayer(ownerFormConfig());

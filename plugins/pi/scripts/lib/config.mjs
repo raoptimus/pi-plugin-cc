@@ -506,7 +506,13 @@ const PROJECT_FORBIDDEN_SANDBOX_KEYS = [
   // the agent directory an untrusted repository would otherwise put back on the
   // shared one, and `isolateCaches` is the switch that separates them at all.
   "volume",
-  "isolateCaches"
+  "isolateCaches",
+  // Since the preset-pools work `samplingParams` travels from the resolved
+  // sandbox into every paid request body (`pi.mjs`/`rpc.mjs` → the credential
+  // proxy). Before that it only came from the owner's model registry, so a
+  // repository able to set it would be setting its own price ceiling — say,
+  // `max_tokens` in the millions — on the owner's account.
+  "samplingParams"
 ];
 
 function sanitizeUntrustedEntry(entry, path, warnings) {
@@ -662,6 +668,18 @@ export function sanitizeProjectLayer(layer, warnings = []) {
       pools[name] = pool;
     }
     clean.concurrencyPools = pools;
+  }
+
+  // These decide how fast a pool the run killed comes back to life and how
+  // long a run camps on a busy one. They are top-level, not sandbox keys, but
+  // `mergeConfigLayer` reads them from the project layer all the same — a
+  // repository shortening its own cooldowns could keep re-triggering a dead
+  // provider on every run of the fleet.
+  for (const key of ["poolWaitMs", "poolCooldownBalanceMs", "poolCooldownQuotaMs", "poolCooldownNetworkMs"]) {
+    if (key in clean) {
+      warnings.push(`${key} ignored: the project config cannot tune pool cooldowns and waits.`);
+      delete clean[key];
+    }
   }
 
   if (isPlainObject(clean.defaults)) {
