@@ -60,6 +60,15 @@ import { terminateProcessTree } from "./lib/process.mjs";
 import { buildSystemPrompt, interpolate, listNamedPrompts, loadTaskTemplate } from "./lib/prompts.mjs";
 import { inboxPath, pushControlMessage } from "./lib/inbox.mjs";
 import { parseJsonLine } from "./lib/jsonl.mjs";
+import {
+  classifyPoolFailure,
+  clearAllPools,
+  clearPool,
+  deadPools,
+  partitionByPoolHealth,
+  readPoolHealth,
+  recordPoolFailure
+} from "./lib/pool-health.mjs";
 import { runPiRpcTurn } from "./lib/rpc.mjs";
 import {
   cacheState,
@@ -359,6 +368,8 @@ const KNOWN_FLAGS = new Set([
   "diff",
   "prune",
   "full",
+  "reset",
+  "reset-all",
   "kind",
   "poll",
   "workspace"
@@ -410,6 +421,7 @@ function usage() {
     `  ${self} steer [job-id] [--follow-up] <message>`,
     `  ${self} watch [job-id] [--follow [--for <s>]] [--since <cursor>] [--tail <n>] [--json]`,
     `  ${self} stats [--by day|model|preset|workspace|kind|status] [--days N|--all] [--json]`,
+    `  ${self} pools [--reset <pool>|--reset-all] [--json]`,
     `  ${self} sandbox [status|build [name|--all]|clean] [--image <tag>]`,
     "                            [--dockerfile <name|path>] [--pi-version <v>]",
     "",
@@ -642,6 +654,11 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
     settings.model = poolPlan.modelOverride;
     settings.sandboxVariants = poolPlan.variants;
     settings.poolWaitMs = Number(config.poolWaitMs ?? 30_000);
+    settings.poolCooldowns = {
+      balanceMs: Number(config.poolCooldownBalanceMs ?? 3_600_000),
+      quotaMs: Number(config.poolCooldownQuotaMs ?? 86_400_000),
+      networkMs: Number(config.poolCooldownNetworkMs ?? 30_000)
+    };
   }
 
   const warnings = [];
@@ -934,6 +951,84 @@ export function applyPickedVariant(settings, picked) {
 }
 
 /**
+ * Drop candidates whose pool is under an unexpired liveness hold, before any
+ * slot waiting happens.
+ *
+ * Busy and dead are different reasons to pass over a pool: a busy pool costs
+ * at most `poolWaitMs` and then hands the run to the next candidate, while a
+ * dead one cannot free its slot at any horizon — waiting for it would spend
+ * the same `poolWaitMs` for nothing on every single dispatch. So liveness is
+ * settled first, on the plugin's own record of proven failures, and the slot
+ * race runs only over the survivors.
+ *
+ * When every candidate is dead the run does not refuse: it says so, naming
+ * each pool, its failure class and its probe deadline, and takes the pool
+ * whose deadline is nearest — waiting for the pool that comes back first
+ * beats falling over immediately on a task someone asked for.
+ *
+ * @returns {{variants: Array, message: string|null}} candidates for the slot
+ *          race, in their original priority order (or deadline order when all
+ *          are dead), plus the line to print when nothing was skipped silently
+ */
+export function selectLiveVariants(variants, { cooldowns = null, now = Date.now() } = {}) {
+  const { alive, dead, deadByPool } = partitionByPoolHealth(variants, { now });
+  if (!dead.length) {
+    return { variants, message: null };
+  }
+  const describe = (variant) =>
+    `pool "${variant.pool}" (${deadByPool[variant.pool].class}, until ${deadByPool[variant.pool].retryAt}: ${deadByPool[variant.pool].reason})`;
+  const skipped = dead.map(describe).join(", ");
+  if (alive.length) {
+    return {
+      variants: alive,
+      message: `Skipping dead ${dead.length === 1 ? "pool" : "pools"}: ${skipped}.`
+    };
+  }
+  return {
+    // Deadline order: the probe race starts with the pool that returns first.
+    variants: dead,
+    message:
+      "Every pool of this preset is dead; taking the one whose probe deadline is nearest. " +
+      `${dead.map(describe).join(", ")}.`
+  };
+}
+
+/**
+ * Feed the run's outcome back into the pool liveness record.
+ *
+ * A successful run proves the pool works and erases the record entirely, so
+ * the next dispatch skips nothing. A failed run only moves the record when the
+ * refusal belongs to the POOL — balance, quota, unreachable endpoint. A `400`
+ * or an unknown-model error says nothing about the account behind the pool,
+ * and recording it would let one mistyped command evict a live pool.
+ *
+ * Runs without a pool (no preset, or a preset of the old shape) leave no
+ * record and read none, whatever the state file holds.
+ */
+export function settlePoolHealth(settings, execution, thrownError) {
+  const pool = settings?.sandbox?.concurrencyGroup;
+  if (!pool || !settings?.poolCooldowns) {
+    return null;
+  }
+  if (!thrownError && Number(execution?.exitStatus ?? 1) === 0) {
+    clearPool(pool);
+    return null;
+  }
+  const text = thrownError
+    ? thrownError instanceof Error
+      ? thrownError.message
+      : String(thrownError)
+    : (execution?.errors ?? []).join("\n");
+  const verdict = classifyPoolFailure(text);
+  if (!verdict) {
+    return null;
+  }
+  const { balanceMs, quotaMs, networkMs } = settings.poolCooldowns;
+  const record = recordPoolFailure(pool, verdict.class, verdict.reason, { balanceMs, quotaMs, networkMs });
+  return { pool, ...record };
+}
+
+/**
  * Shared execution path for delegate and review.
  */
 async function executeRun({
@@ -962,7 +1057,11 @@ async function executeRun({
     stderr: Boolean(flags.background)
   });
   if (settings.sandboxVariants?.length) {
-    const picked = await awaitVariantSlot(settings.sandboxVariants, {
+    const live = selectLiveVariants(settings.sandboxVariants, { cooldowns: settings.poolCooldowns });
+    if (live.message) {
+      onProgress({ phase: "starting", message: live.message });
+    }
+    const picked = await awaitVariantSlot(live.variants, {
       poolWaitMs: settings.poolWaitMs ?? 30_000,
       timeoutMs: settings.timeoutMs,
       onProgress
@@ -1102,9 +1201,12 @@ async function executeRun({
   } catch (error) {
     // `runTrackedJob` has already recorded the failure; this only announces
     // it. Rethrown untouched afterwards so the command still reports it.
+    settlePoolHealth(settings, null, error);
     announceTerminal("failed");
     throw error;
   }
+
+  settlePoolHealth(settings, execution, null);
 
   announceTerminal(execution.aborted ? "cancelled" : execution.exitStatus === 0 ? "completed" : "failed", execution);
 
@@ -2165,6 +2267,44 @@ async function commandStats(argv, workspaceRoot) {
   }
 }
 
+async function commandPools(argv, workspaceRoot) {
+  const { flags } = parseArgs(argv, { booleans: ["json", "reset-all"], strings: ["reset"] });
+
+  if (flags["reset-all"] || flags.reset) {
+    // Debugging, not the circuit: the normal return of a pool is a successful
+    // run or an expired deadline, so this exists only for someone who already
+    // knows why the record is wrong.
+    const cleared = flags["reset-all"] ? clearAllPools() : clearPool(flags.reset);
+    if (!flags["reset-all"] && !cleared) {
+      throw new Error(`No liveness record for pool "${flags.reset}" — nothing to reset.`);
+    }
+    return output(
+      flags["reset-all"] ? "Cleared all pool liveness records.\n" : `Cleared liveness record for pool \`${flags.reset}\`.\n`,
+      { cleared: flags["reset-all"] ? "all" : flags.reset },
+      flags.json
+    );
+  }
+
+  const pools = readPoolHealth();
+  const names = Object.keys(pools).sort();
+  if (flags.json) {
+    return output("", { pools }, true);
+  }
+  if (!names.length) {
+    return output("No pool liveness records: every known pool is considered live.\n", { pools }, false);
+  }
+  const lines = ["Pool liveness records:", ""];
+  for (const name of names) {
+    const record = pools[name];
+    const expired = Number(record.retryAtMs) <= Date.now();
+    lines.push(
+      `- \`${name}\` — ${record.class}, until ${record.retryAt}${expired ? " (deadline passed, participating again)" : ""}: ${record.reason}`
+    );
+  }
+  lines.push("", "Reset with `pools --reset <pool>` or `pools --reset-all`.");
+  return output(`${lines.join("\n")}\n`, { pools }, false);
+}
+
 async function commandSandbox(argv, workspaceRoot) {
   const { flags, positional } = parseArgs(argv, {
     booleans: ["json", "no-cache", "all"],
@@ -2793,6 +2933,7 @@ const COMMANDS = {
   steer: commandSteer,
   watch: commandWatch,
   stats: commandStats,
+  pools: commandPools,
   sandbox: commandSandbox
 };
 

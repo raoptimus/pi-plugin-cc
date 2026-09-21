@@ -55,6 +55,14 @@ const BUILT_IN = {
   // How long a run is willing to wait for a busy pool before moving on to the
   // next variant of the same role; 0 means "only a pool free right now".
   poolWaitMs: 30_000,
+  // How long a pool proven dead stays out of the choice, per failure class.
+  // Balance: an hour — money can arrive at any moment, a day of idle capacity
+  // buys nothing. Quota: a day, unless the provider names its own window (then
+  // the named span wins). Network: the first hold, doubled on consecutive
+  // failures up to ten times this value (30s → 60s → 120s → 300s by default).
+  poolCooldownBalanceMs: 3_600_000,
+  poolCooldownQuotaMs: 86_400_000,
+  poolCooldownNetworkMs: 30_000,
   // How long a provider is assumed to keep a cached prompt. A continued
   // session replays its whole history: inside this window the provider reads
   // it from cache, past it the same tokens are billed again at the input rate.
@@ -458,6 +466,9 @@ export function mergeConfigLayer(base, layer) {
     sandboxProfiles: mergeNamed(base.sandboxProfiles, layer.sandboxProfiles),
     concurrencyPools: { ...base.concurrencyPools, ...(isPlainObject(layer.concurrencyPools) ? layer.concurrencyPools : {}) },
     poolWaitMs: layer.poolWaitMs ?? base.poolWaitMs,
+    poolCooldownBalanceMs: layer.poolCooldownBalanceMs ?? base.poolCooldownBalanceMs,
+    poolCooldownQuotaMs: layer.poolCooldownQuotaMs ?? base.poolCooldownQuotaMs,
+    poolCooldownNetworkMs: layer.poolCooldownNetworkMs ?? base.poolCooldownNetworkMs,
     cacheTtl: mergeEntry(base.cacheTtl ?? {}, isPlainObject(layer.cacheTtl) ? layer.cacheTtl : {}),
     gitProxy: mergeNamed(base.gitProxy ?? {}, layer.gitProxy),
     commands: mergeNamed(base.commands, layer.commands)

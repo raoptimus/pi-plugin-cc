@@ -80,6 +80,14 @@ export function fleetEventsPath() {
 }
 
 /**
+ * Machine-wide records that are not per-workspace share the same root; the
+ * root itself stays private so bucket logic cannot leak into callers.
+ */
+export function pluginStateRoot() {
+  return stateRoot();
+}
+
+/**
  * Every job this machine knows about, across workspaces.
  *
  * State is bucketed per workspace so two checkouts never share history, which
