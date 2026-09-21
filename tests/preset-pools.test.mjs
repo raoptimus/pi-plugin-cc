@@ -603,3 +603,43 @@ test("the slot-time pick keeps the developed sandbox and moves only model-choice
   assert.equal(settings.thinking, "low", "the model record's thinking overrides the preset's");
   assert.deepEqual(settings.tags, ["role-tag", "model-tag"]);
 });
+
+// A pin whose pool holds none of the preset's models used to produce zero
+// variants and fall through to pi's default model — no pool limit, no refusal.
+test("a pool pin that matches nothing is a refusal naming the preset, pool and models", async () => {
+  const { buildRunSettings } = await import("../plugins/pi/scripts/pi-companion.mjs");
+  const config = normalizeConfigLayer(ownerFormConfig());
+  config.presets.alphaOnly = { id: "alphaOnly", models: [`fast-${UNIQUE}`, `smart-${UNIQUE}`], sandboxService: "agent" };
+  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-pins-"));
+  const run = (flags) =>
+    buildRunSettings({ command: "delegate", flags, workspaceRoot, runRoot: workspaceRoot, config });
+  try {
+    assert.throws(
+      () => run({ preset: `alphaOnly-beta-${UNIQUE}` }),
+      (error) => {
+        assert.match(error.message, new RegExp(`"alphaOnly"`));
+        assert.match(error.message, new RegExp(`beta-${UNIQUE}`));
+        assert.match(error.message, new RegExp(`fast-${UNIQUE} \\(alpha-${UNIQUE}\\)`));
+        return true;
+      },
+      "the refusal names the preset, the empty pool and what the preset does have"
+    );
+
+    // The same zero with a `--model` in play names the filter too.
+    assert.throws(
+      () => run({ preset: `alphaOnly-beta-${UNIQUE}`, model: `fast-${UNIQUE}` }),
+      (error) => {
+        assert.match(error.message, /has no models in pool/);
+        assert.match(error.message, /matching --model/);
+        return true;
+      },
+      "the refusal names the --model filter that rode along"
+    );
+
+    // Without a pin an unknown --model stays a literal override — unchanged.
+    const literal = run({ preset: "alphaOnly", model: "other/model" });
+    assert.equal(literal.sandboxVariants.length, 2, "no pin, so every candidate stays");
+  } finally {
+    fs.rmSync(workspaceRoot, { recursive: true, force: true });
+  }
+});

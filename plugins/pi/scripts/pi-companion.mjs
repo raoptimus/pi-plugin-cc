@@ -615,6 +615,25 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
     poolPin: settings.presetPool ?? null,
     modelWanted: flags.model ?? null
   });
+  if (!poolPlan.variants.length && settings.presetPool) {
+    // A pin that survives resolution but matches nothing (the pool holds no
+    // model of this preset, or `--model` filtered the pinned pool down to
+    // zero) used to fall through and run on pi's default model, without the
+    // pool's limit. The name was asked for on purpose: refuse, naming what
+    // the preset actually has.
+    const available = (poolPreset.models ?? []).map((id) => {
+      for (const [poolName, pool] of Object.entries(config.concurrencyPools ?? {})) {
+        if (pool?.models?.[id]) return `${id} (${poolName})`;
+      }
+      return id;
+    });
+    throw new Error(
+      `Preset "${settings.presetName}" has no models in pool "${settings.presetPool}"` +
+        (flags.model ? ` matching --model "${flags.model}"` : "") +
+        `. Refusing instead of running without the pool. ` +
+        (available.length ? `Available models: ${available.join(", ")}.` : "The preset lists no models.")
+    );
+  }
   if (poolPlan.variants.length) {
     // The first candidate stands in until the slot wait picks the real one:
     // preflight, mount gaps and the label only need a sandbox shaped like the
