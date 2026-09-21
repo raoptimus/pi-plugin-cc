@@ -423,3 +423,50 @@ test("фикс: concurrencyGroup на пресете снимается, наз�
   );
   assert.deepEqual(verifyEquivalence(raw, config), []);
 });
+
+// Фикс-раунд 3: двусмысленный провайдер и сверка по фактическому пулу варианта.
+
+test("фикс-раунд 3: провайдер, попадающий в два пула, — отказ, а не первый скан-совпадение", () => {
+  const raw = liveFleet();
+  // Провайдер "zai-coding" содержит имя пула "zai" и попал бы в оба: реестр
+  // расселил бы запись в два пула, а слоты старых имён переехали бы молча.
+  raw.concurrencyPools = { zai: 7, "zai-coding": 2, deepseek: 7, vllm: 1 };
+  assert.throws(
+    () => migrateConfig(raw),
+    (error) => {
+      assert.match(error.message, /zai-coding-cn\/glm-5\.3-flash.*more than one pool/s);
+      assert.match(error.message, /zai.*zai-coding/s);
+      return true;
+    }
+  );
+});
+
+test("фикс-раунд 3: сверка «группа слотов = пул» идёт по пулу варианта, а не по скану провайдера", () => {
+  // Провайдер "ax" содержится в обоих пулах; модель пресета сидит в пуле "x",
+  // но пул "ax" (с другой моделью того же провайдера) стоит в списке первым.
+  // Скан «первый пул с провайдером» подхватывал бы "ax" и давал ложный отказ;
+  // фактический пул варианта — "x", и группа "x" ему равна.
+  const old = {
+    concurrencyPools: { ax: 4, x: 2 },
+    sandboxProfiles: { prof: { concurrencyGroup: "x" } },
+    presets: { p: { model: "ax/m", sandbox: "prof" } }
+  };
+  const fresh = {
+    presets: { p: { models: ["x-m"], sandboxService: "svc" } },
+    sandboxServices: [{ id: "svc" }],
+    concurrencyPools: [
+      { pool: "ax", limit: 4, models: [{ id: "ax-other", provider: "ax", name: "other" }] },
+      { pool: "x", limit: 2, models: [{ id: "x-m", provider: "ax", name: "m" }] }
+    ]
+  };
+  assert.deepEqual(verifyEquivalence(old, fresh), [], "variant pool x equals the old slot group x");
+
+  // А если группа честно расходится с пулом варианта — отказ называет оба.
+  const rewired = JSON.parse(JSON.stringify(old));
+  rewired.sandboxProfiles.prof.concurrencyGroup = "ax";
+  const problems = verifyEquivalence(rewired, fresh);
+  assert.ok(
+    problems.some((line) => line.includes("p") && line.includes('"ax"') && line.includes('"x"')),
+    `expected the mismatch to name both pools, got: ${problems.join(" | ")}`
+  );
+});

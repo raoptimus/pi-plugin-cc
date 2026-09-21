@@ -171,6 +171,16 @@ function buildPools(config, poolOrder) {
     if (!entry.pools.size) {
       throw new Error(`Model "${entry.provider}/${entry.name}" matches none of the configured pools.`);
     }
+    // Двусмысленный провайдер делает пул модели неопределённым: реестр расселил
+    // бы запись в оба пула (две записи с разными id), а сверка эквивалентности
+    // не смогла бы сказать, куда переехали слоты старого имени. Отказ в одну
+    // сторону лучше двух молчаливых разных ответов.
+    if (entry.pools.size > 1) {
+      throw new Error(
+        `Model "${entry.provider}/${entry.name}" matches more than one pool (${[...entry.pools].sort().join(", ")}). ` +
+          "Rename the provider or the pool so every model belongs to exactly one."
+      );
+    }
   }
 
   const poolsOut = poolOrder.map((pool) => {
@@ -869,9 +879,10 @@ export function verifyEquivalence(oldRaw, newRaw, declared = []) {
     if (oldSandboxProfile && old.sandboxProfiles?.[oldSandboxProfile]) {
       const group = normalizeSandbox(oldSandboxProfile, old.sandboxProfiles ?? {}).concurrencyGroup;
       if (group != null) {
-        const pool = Object.values(fresh.concurrencyPools ?? {}).find((entry) =>
-          Object.values(entry.models ?? {}).some((model) => model.provider === variant.provider)
-        );
+        // Фактический пул варианта уже вычислен buildVariants из реестра;
+        // прежний скан «первый пул, где есть провайдер» давал ложный пропуск и
+        // ложный отказ, когда провайдер мог бы попасться в двух пулах.
+        const pool = Object.values(fresh.concurrencyPools ?? {}).find((entry) => entry.pool === variant.pool);
         if (!pool) {
           problems.push(`${name}: модель "${variant.model}" не входит ни в один пул новой конфигурации.`);
         } else if (pool.pool !== group && !(pool.aliases ?? []).includes(group)) {
