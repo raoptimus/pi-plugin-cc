@@ -535,3 +535,28 @@ test("фикс-раунд 3: различие профиля семейства 
     });
   }
 });
+
+// Фикс-раунд 3: неизвестный флаг и лишний позиционный аргумент — жёсткая
+// ошибка, а не тихий пропуск (конвенция репозитория: unknown flag is a hard
+// error). Опечатка вида --oout с exit 0 без записи обманывала владельца.
+
+test("фикс-раунд 3: неизвестный флаг и второй позиционный аргумент — exit 2", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "migrate-args-"));
+  const src = path.join(dir, "config.json");
+  fs.writeFileSync(src, JSON.stringify(liveFleet()));
+  const before = fs.readFileSync(src, "utf8");
+
+  for (const argv of [["--dffi"], ["--oout", "new.json"], [src, "extra.json"], ["--out"]]) {
+    let error;
+    try {
+      execFileSync(process.execPath, [SCRIPT, ...argv], { encoding: "utf8" });
+    } catch (caught) {
+      error = caught;
+    }
+    assert.ok(error, `argv [${argv.join(" ")}] must fail`);
+    assert.equal(error.status, 2, `argv [${argv.join(" ")}] must exit 2, got ${error.status}`);
+  }
+  assert.equal(fs.readdirSync(dir).sort().join(","), "config.json", "nothing written on any usage error");
+  assert.equal(fs.readFileSync(src, "utf8"), before);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
