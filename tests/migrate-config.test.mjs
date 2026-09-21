@@ -681,3 +681,412 @@ test("git-настройки переезжают в agent-base один раз;
   // Сверка принимает изменение ровно по названным старым именам и полю sandbox.
   assert.deepEqual(verifyEquivalence(raw, config, declaredDivergences()), []);
 });
+
+// Закрытие мутационных выживших: каждый кейс ниже ассертит наблюдаемое
+// поведение конкретной ветки, а не вход и итог.
+
+/** Минимальный флот: одна роль из трёх членов + одиночка, строковые песочницы. */
+function miniFleet() {
+  const member = (model, thinking, extra = {}) => ({ model, thinking, sandbox: "agent", ...extra });
+  return {
+    sandboxProfiles: {
+      "agent-base": { image: "pi-sandbox-agent:latest", env: ["BASE=1"] },
+      agent: { profile: "agent-base", image: "pi-sandbox-agent:latest", concurrencyGroup: "zai" }
+    },
+    concurrencyPools: { zai: 2, deepseek: 2, vllm: 1 },
+    presets: {
+      "r-zai": member("zai/m", "low"),
+      "r-deepseek": member("deepseek/d", "low"),
+      "r-local": member("vllm/m", "off"),
+      solo: member("zai/m2", "high")
+    }
+  };
+}
+
+test("commonDescription: берётся описание большинства, не общий префикс", () => {
+  const raw = miniFleet();
+  raw.presets["r-zai"].description = "Роль делает работу";
+  raw.presets["r-deepseek"].description = "Роль делает работу";
+  raw.presets["r-local"].description = "Роль делает работу — на локальной модели vLLM";
+  const preset = migrateConfig(raw).config.presets.find((entry) => entry.id === "r");
+  assert.equal(preset.description, "Роль делает работу", "the majority text wins whole, no char prefix");
+});
+
+test("commonDescription: пустые и не-строки отфильтрованы; ничья — первое по порядку; результат обрезан", () => {
+  const tie = miniFleet();
+  tie.presets["r-zai"].description = "B первым";
+  tie.presets["r-deepseek"].description = "A";
+  tie.presets["r-local"].description = "   ";
+  assert.equal(migrateConfig(tie).config.presets.find((p) => p.id === "r").description, "B первым", "a tie keeps the first listed");
+
+  const blanks = miniFleet();
+  blanks.presets["r-zai"].description = "  ";
+  blanks.presets["r-deepseek"].description = null;
+  blanks.presets["r-local"].description = " X ";
+  assert.equal(migrateConfig(blanks).config.presets.find((p) => p.id === "r").description, "X", "blank entries are dropped, result trimmed");
+
+  const allBlank = miniFleet();
+  allBlank.presets["r-zai"].description = "";
+  allBlank.presets["r-deepseek"].description = null;
+  allBlank.presets["r-local"].description = "  ";
+  assert.equal(
+    migrateConfig(allBlank).config.presets.find((p) => p.id === "r").description,
+    undefined,
+    "no usable description means none"
+  );
+});
+
+test("buildPools: нулевой, отрицательный и нечисловой лимит пула — отказ; priority по умолчанию 10, числовой переносится", () => {
+  // Объектная форма с некорректным лимитом отвергается ещё нормализатором
+  // (normalizeConcurrencyPool), поэтому до ветки buildPools доходят числа.
+  for (const limit of [0, -3]) {
+    const raw = miniFleet();
+    raw.concurrencyPools = { zai: limit, deepseek: 2, vllm: 1 };
+    assert.throws(() => migrateConfig(raw), /pool "zai" has no usable slot limit/is, `limit ${JSON.stringify(limit)} must be refused`);
+  }
+  const withPriority = miniFleet();
+  withPriority.concurrencyPools = { zai: { limit: 2, priority: 3 }, deepseek: 2, vllm: { limit: 1, priority: "не число" } };
+  const pools = Object.fromEntries(migrateConfig(withPriority).config.concurrencyPools.map((pool) => [pool.pool, pool]));
+  assert.equal(pools.zai.priority, 3, "a numeric priority carries over");
+  assert.equal(pools.vllm.priority, 10, "a junk priority falls back to 10");
+});
+
+test("buildPools: провайдер вне всех пулов — отказ с именем модели", () => {
+  const raw = miniFleet();
+  raw.presets.solo.model = "ghost/lonely";
+  assert.throws(() => migrateConfig(raw), (error) => {
+    assert.match(error.message, /ghost\/lonely/);
+    assert.match(error.message, /none of the configured pools/);
+    return true;
+  });
+});
+
+test("migrateConfig: пул vllm уходит в конец порядка пулов при любом порядке ключей входа", () => {
+  const raw = miniFleet();
+  // Вставка vllm первой: сортировка обязана отправить его последним.
+  raw.concurrencyPools = { vllm: 1, zai: 2, deepseek: 2 };
+  const { config } = migrateConfig(raw);
+  assert.deepEqual(config.concurrencyPools.map((pool) => pool.pool), ["zai", "deepseek", "vllm"]);
+});
+
+test("buildServices: база выбирается по суффиксу -base, даже когда ключ в объекте не первый", () => {
+  const raw = miniFleet();
+  const profiles = raw.sandboxProfiles;
+  raw.sandboxProfiles = Object.fromEntries([["agent", profiles.agent], ["agent-base", profiles["agent-base"]]]);
+  const services = migrateConfig(raw).config.sandboxServices;
+  assert.deepEqual(
+    services.map((service) => service.id),
+    ["agent-base", "agent"],
+    "agent-base is the extend root regardless of key order"
+  );
+});
+
+test("buildServices: канонический id группы — самый короткий; при равной длине — первый по алфавиту", () => {
+  const raw = miniFleet();
+  // Два профиля с байт-равным разрешённым содержимым и равной длиной имён.
+  raw.sandboxProfiles["svc-bbb"] = { profile: "agent-base", image: "pi-sandbox-agent:latest", env: ["SVC=1"] };
+  raw.sandboxProfiles["svc-aaa"] = { profile: "agent-base", image: "pi-sandbox-agent:latest", env: ["SVC=1"] };
+  const ids = migrateConfig(raw).config.sandboxServices.map((service) => service.id);
+  assert.ok(ids.includes("svc-aaa") && !ids.includes("svc-bbb"), `shortest/alphabetical canonical wins, got: ${ids.join(", ")}`);
+});
+
+test("buildServices: наследник, ОТЛИЧАЮЩИЙСЯ от базы скалярным полем, не записывается через extend — standalone", () => {
+  const raw = miniFleet();
+  // Скалярное поле, разошедшееся с базой, аддитивный extend выразить не может:
+  // сервис обязан быть записан целиком.
+  raw.sandboxProfiles.lite = { profile: "agent-base", image: "pi-sandbox-agent:latest", user: "nobody" };
+  const lite = migrateConfig(raw).config.sandboxServices.find((service) => service.id === "lite");
+  assert.equal(lite.extend, undefined, "a scalar divergence cannot ride additive extend");
+  assert.equal(lite.user, "nobody");
+  assert.equal(lite.image, "pi-sandbox-agent:latest");
+});
+
+test("buildServices: профиль, байт-равный базе, остаётся собственным сервисом с пустым extend", () => {
+  const raw = miniFleet();
+  raw.sandboxProfiles.twin = { profile: "agent-base", image: "pi-sandbox-agent:latest", concurrencyGroup: "zai" };
+  const twin = migrateConfig(raw).config.sandboxServices.find((service) => service.id === "twin");
+  assert.deepEqual(twin, { id: "twin", extend: "agent-base" }, "content-equal to base is subsumed with an empty delta");
+});
+
+test("solveModelThinking: две роли требуют одну модель на разных жёстких уровнях — отказ с именем модели", () => {
+  const raw = {
+    sandboxProfiles: miniFleet().sandboxProfiles,
+    concurrencyPools: { zai: 2, vllm: 2 },
+    presets: {
+      "f1-zai": { model: "zai/m", thinking: "low", sandbox: "agent" },
+      "f1-local": { model: "vllm/m", thinking: "off", sandbox: "agent" },
+      "f2-zai": { model: "zai/m", thinking: "high", sandbox: "agent" },
+      "f2-local": { model: "vllm/m2", thinking: "med", sandbox: "agent" }
+    }
+  };
+  assert.throws(() => migrateConfig(raw), (error) => {
+    assert.match(error.message, /zai\/m/);
+    assert.match(error.message, /different thinking levels/);
+    return true;
+  });
+});
+
+test("solveModelThinking: два одиночки на одной модели с разными уровнями — запись чистая, уровни остаются у пресетов", () => {
+  const raw = miniFleet();
+  raw.presets = {
+    s1: { model: "zai/m", thinking: "low", sandbox: "agent" },
+    s2: { model: "zai/m", thinking: "high", sandbox: "agent" }
+  };
+  const { config } = migrateConfig(raw);
+  const byId = Object.fromEntries(config.presets.map((preset) => [preset.id, preset]));
+  assert.equal(byId.s1.thinking, "low");
+  assert.equal(byId.s2.thinking, "high");
+  const record = config.concurrencyPools.flatMap((pool) => pool.models).find((model) => model.id === "zai-m");
+  assert.equal(record.thinking, undefined, "a conflicted record stays clean");
+  assert.deepEqual(verifyEquivalence(raw, config, declaredDivergences()), []);
+});
+
+test("solveModelThinking: однообразная роль переносит свой уровень на пресет, запись его повторяет", () => {
+  const raw = miniFleet();
+  raw.presets["r-zai"].thinking = "high";
+  raw.presets["r-deepseek"].thinking = "high";
+  raw.presets["r-local"].thinking = "high";
+  const { config } = migrateConfig(raw);
+  const role = config.presets.find((preset) => preset.id === "r");
+  assert.equal(role.thinking, "high");
+  const record = config.concurrencyPools.flatMap((pool) => pool.models).find((model) => model.id === "deepseek-d");
+  assert.equal(record.thinking, "high");
+});
+
+test("carrySingle: одиночка без model и sandbox переносится голой записью; concurrencyGroup снимается безвозвратно", () => {
+  const raw = miniFleet();
+  raw.presets.bare = { systemPrompt: "@x", concurrencyGroup: "zai" };
+  const carried = migrateConfig(raw).config.presets.find((preset) => preset.id === "bare");
+  assert.deepEqual(carried, { id: "bare", systemPrompt: "@x" }, "no model means no models list, no sandbox means no sandboxService");
+});
+
+
+
+test("buildFamily: строковая песочница без собственного env — строковый sandboxService; git-различия env схлопыванию не мешают", () => {
+  const raw = miniFleet();
+  const gitOnly = { profile: "agent", env: ["GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=core.hooksPath", "GIT_CONFIG_VALUE_0=/pi-githooks"] };
+  raw.presets["r-zai"].sandbox = gitOnly;
+  raw.presets["r-deepseek"].sandbox = gitOnly;
+  // У local — лишняя credential-запись сверх git: после stripGit наборы равны.
+  raw.presets["r-local"].sandbox = { profile: "agent", env: [...gitOnly.env, "GIT_CONFIG_KEY_1=credential.vllm"] };
+  const preset = migrateConfig(raw).config.presets.find((entry) => entry.id === "r");
+  assert.equal(preset.sandboxService, "agent", "env that is git-only after stripping leaves no extras, plain string form");
+  const envDeclared = declaredDivergences().filter((entry) => entry.reason.includes("env членов семейства"));
+  assert.equal(envDeclared.length, 0, "a git-only difference must not be declared as a real env divergence");
+});
+
+test("buildFamily: действительное различие env — вариант большинства на пресете, отступивший член назван с было/стало", () => {
+  const raw = miniFleet();
+  raw.presets["r-zai"].sandbox = { profile: "agent", env: ["PI_HOOKS=common"] };
+  raw.presets["r-deepseek"].sandbox = { profile: "agent", env: ["PI_HOOKS=common"] };
+  raw.presets["r-local"].sandbox = { profile: "agent", env: ["PI_HOOKS=odd"] };
+  const preset = migrateConfig(raw).config.presets.find((entry) => entry.id === "r");
+  assert.deepEqual(preset.sandboxService.env, ["PI_HOOKS=common"], "the majority env wins");
+  const entry = [...declaredDivergences()].reverse().find((item) => item.preset === "r-local" && item.field === "sandbox");
+  assert.ok(entry, "the diverging member is named");
+  assert.deepEqual(entry.was, ["PI_HOOKS=odd"]);
+  assert.deepEqual(entry.now, ["PI_HOOKS=common"]);
+});
+
+test("buildFamily: песочница члена ссылается на неизвестный профиль — отказ, а не молчаливый пропуск", () => {
+  const raw = miniFleet();
+  raw.presets["r-deepseek"].sandbox = "no-such-profile";
+  assert.throws(() => migrateConfig(raw), /no-such-profile|not defined|spans sandbox profiles/is);
+});
+
+test("buildFamily: общие поля members переносятся один раз; model и description в общую часть не попадают", () => {
+  const raw = miniFleet();
+  raw.presets["r-zai"].git = { name: "Fleet", email: "fleet@example.com" };
+  raw.presets["r-deepseek"].git = { name: "Fleet", email: "fleet@example.com" };
+  raw.presets["r-local"].git = { name: "Fleet", email: "fleet@example.com" };
+  const preset = migrateConfig(raw).config.presets.find((entry) => entry.id === "r");
+  assert.deepEqual(preset.git, { name: "Fleet", email: "fleet@example.com" });
+  assert.equal(preset.model, undefined);
+});
+
+test("migrateConfig: чужие GIT_CONFIG_* в agent-base вытесняются каноническим набором, не-git_env сохраняется", () => {
+  const raw = miniFleet();
+  raw.sandboxProfiles["agent-base"].env = [
+    "PATH=/t/bin",
+    "GIT_CONFIG_COUNT=9",
+    "GIT_CONFIG_KEY_0=core.hooksPath",
+    "GIT_CONFIG_VALUE_0=/stale",
+    "KEEP=1"
+  ];
+  const gitBase = migrateConfig(raw).config.sandboxServices.find((service) => service.id === "agent-base");
+  assert.deepEqual(
+    gitBase.env,
+    [
+      "PATH=/t/bin",
+      "KEEP=1",
+      "GIT_CONFIG_COUNT=2",
+      "GIT_CONFIG_KEY_0=core.hooksPath",
+      "GIT_CONFIG_VALUE_0=/pi-githooks",
+      "GIT_CONFIG_KEY_1=commit.gpgsign",
+      "GIT_CONFIG_VALUE_1=false"
+    ],
+    "stale git entries are filtered out before the canonical set is appended, non-git env preserved in place"
+  );
+});
+
+test("migrateConfig: hooksPath на другом индексе KEY_10 узнаётся; похожая запись без точного равенства — не узнаётся", () => {
+  const raw = miniFleet();
+  const withHooks = (preset, keyLine) => ({
+    ...preset,
+    sandbox: { profile: "agent", env: [`PI_HOOKS=x`, "GIT_CONFIG_COUNT=1", keyLine, "GIT_CONFIG_VALUE_0=/pi-githooks"] }
+  });
+  raw.presets["r-deepseek"] = withHooks(raw.presets["r-deepseek"], "GIT_CONFIG_KEY_10=core.hooksPath");
+  raw.presets["r-local"] = withHooks(raw.presets["r-local"], "GIT_CONFIG_KEY_0=core.hooksPath=extra");
+
+  migrateConfig(raw);
+  const hooks = [...declaredDivergences()].reverse().find((entry) => entry.reason.includes("core.hooksPath"));
+  assert.ok(hooks, "the gaining-roles divergence is declared");
+  assert.ok(hooks.presets.includes("r-zai"), "a role without hooksPath is named as gaining");
+  assert.ok(!hooks.presets.includes("r-deepseek"), "KEY_10 counts as having hooksPath");
+  assert.ok(hooks.presets.includes("r-local"), "a near-miss entry does not count as having hooksPath");
+});
+
+test("migrateConfig: без сервиса agent-base — отказ: git-настройкам некуда жить", () => {
+  const raw = miniFleet();
+  delete raw.sandboxProfiles["agent-base"];
+  raw.sandboxProfiles.agent = { image: "pi-sandbox-agent:latest", concurrencyGroup: "zai" };
+  assert.throws(() => migrateConfig(raw), (error) => {
+    assert.match(error.message, /agent-base/);
+    assert.match(error.message, /nowhere to live/);
+    return true;
+  });
+});
+
+test("verifyEquivalence: объявление закрывает ровно свою пару пресет+поле, чужие расхождения остаются ошибками", () => {
+  const base = () => ({
+    concurrencyPools: { ax: 4 },
+    sandboxProfiles: { p1: { concurrencyGroup: "ax" } },
+    presets: {
+      q1: { model: "ax/m", sandbox: "p1", systemPrompt: "@one" },
+      q2: { model: "ax/m", sandbox: "p1", systemPrompt: "@two" }
+    }
+  });
+  const freshOf = (oldRaw) => ({
+    presets: {
+      q1: { models: ["ax-m"], sandboxService: "svc", systemPrompt: oldRaw.presets.q1.systemPrompt },
+      q2: { models: ["ax-m"], sandboxService: "svc", systemPrompt: oldRaw.presets.q2.systemPrompt }
+    },
+    sandboxServices: [{ id: "svc" }],
+    concurrencyPools: [{ pool: "ax", limit: 4, models: [{ id: "ax-m", provider: "ax", name: "m" }] }]
+  });
+  const old = base();
+  const fresh = freshOf(old);
+  fresh.presets.q1.systemPrompt = "@corrupt";
+  // Объявление для ДРУГОГО пресета и того же поля не закрывает q1.
+  let problems = verifyEquivalence(old, fresh, [{ preset: "q2", field: "systemPrompt" }]);
+  assert.ok(problems.some((line) => line.includes("q1") && line.includes("systemPrompt")), `mismatch outside the declaration must surface: ${problems.join(" | ")}`);
+  // Объявление ровно этой пары — принимается молча, и только она.
+  problems = verifyEquivalence(old, fresh, [{ preset: "q1", field: "systemPrompt" }]);
+  assert.deepEqual(problems, [], "the declared pair alone is silently accepted");
+  // Объявление того же пресета по ДРУГОМУ полю не закрывает systemPrompt.
+  problems = verifyEquivalence(old, fresh, [{ preset: "q1", field: "tags" }]);
+  assert.ok(problems.some((line) => line.includes("q1") && line.includes("systemPrompt")), "the declaration is per field, not per preset");
+});
+
+test("verifyEquivalence: теги сравниваются как множество (порядок не важен), состав — строго", () => {
+  const old = {
+    concurrencyPools: { ax: 4 },
+    sandboxProfiles: { p1: { concurrencyGroup: "ax" } },
+    presets: { q: { model: "ax/m", sandbox: "p1", tags: ["b", "a"], env: ["X=1"] } }
+  };
+  const fresh = {
+    presets: { q: { models: ["ax-m"], sandboxService: "svc", tags: ["a", "b"], env: ["X=1"] } },
+    sandboxServices: [{ id: "svc" }],
+    concurrencyPools: [{ pool: "ax", limit: 4, models: [{ id: "ax-m", provider: "ax", name: "m" }] }]
+  };
+  assert.deepEqual(verifyEquivalence(old, fresh), [], "same tags in another order are equivalent");
+  const wrongTags = JSON.parse(JSON.stringify(fresh));
+  wrongTags.presets.q.tags = ["a", "c"];
+  assert.ok(
+    verifyEquivalence(old, wrongTags).some((line) => line.includes("tags")),
+    "a different tag set must be refused"
+  );
+  const wrongEnv = JSON.parse(JSON.stringify(fresh));
+  wrongEnv.presets.q.env = ["X=2"];
+  assert.ok(
+    verifyEquivalence(old, wrongEnv).some((line) => line.includes("env")),
+    "a changed preset env must be refused"
+  );
+});
+
+test("buildServices: пресет может ссылаться на саму базу — base знает своё имя в карте сервисов", () => {
+  const raw = liveFleet();
+  raw.presets.reviewer.sandbox = "agent-base";
+  const reviewer = migrateConfig(raw).config.presets.find((preset) => preset.id === "reviewer");
+  assert.equal(reviewer.sandboxService, "agent-base");
+});
+
+test("verifyEquivalence: maxConcurrent у сгруппированного профиля срезается с ОБОИХ сторон сверки", () => {
+  const old = {
+    concurrencyPools: { ax: 4 },
+    sandboxProfiles: { p1: { concurrencyGroup: "ax", maxConcurrent: 5 } },
+    presets: { q: { model: "ax/m", sandbox: "p1" } }
+  };
+  const fresh = {
+    presets: { q: { models: ["ax-m"], sandboxService: "svc" } },
+    sandboxServices: [{ id: "svc" }],
+    concurrencyPools: [{ pool: "ax", limit: 4, models: [{ id: "ax-m", provider: "ax", name: "m" }] }]
+  };
+  assert.deepEqual(verifyEquivalence(old, fresh), [], "a grouped cap is cut from both contours, still equivalent");
+  const lostGroup = JSON.parse(JSON.stringify(old));
+  delete lostGroup.sandboxProfiles.p1.concurrencyGroup;
+  assert.ok(
+    verifyEquivalence(lostGroup, fresh).some((line) => line.includes("maxConcurrent") || line.includes("sandbox")),
+    "the same cap WITHOUT a group is the old runtime's real limit and must surface"
+  );
+});
+
+test("verifyEquivalence: пресет новой формы без моделей — внятная строка в списке расхождений", () => {
+  const old = {
+    concurrencyPools: { ax: 4 },
+    sandboxProfiles: { p1: { concurrencyGroup: "ax" } },
+    presets: { q: { model: "ax/m", sandbox: "p1" } }
+  };
+  const fresh = {
+    presets: { q: { models: [], sandboxService: "svc" } },
+    sandboxServices: [{ id: "svc" }],
+    concurrencyPools: [{ pool: "ax", limit: 4, models: [{ id: "ax-m", provider: "ax", name: "m" }] }]
+  };
+  assert.deepEqual(verifyEquivalence(old, fresh), ["q: пресет \"q\" не содержит моделей."]);
+});
+
+test("verifyEquivalence: пин *-local ищется в пуле, где модель провайдера ЕСТЬ среди прочих", () => {
+  const old = {
+    concurrencyPools: { ax: 4 },
+    sandboxProfiles: { p1: { concurrencyGroup: "ax" } },
+    presets: {
+      x: { model: "ax/m", sandbox: "p1" },
+      "x-local": { model: "ax/m", sandbox: "p1" }
+    }
+  };
+  const fresh = {
+    presets: { x: { models: ["ax-m"], sandboxService: "svc" } },
+    sandboxServices: [{ id: "svc" }],
+    concurrencyPools: [
+      { pool: "ax", limit: 4, models: [{ id: "ax-m", provider: "ax", name: "m" }, { id: "zz-q", provider: "zz", name: "q" }] }
+    ]
+  };
+  assert.deepEqual(verifyEquivalence(old, fresh), [], "the pin pool is found while the provider is only part of it");
+});
+
+test("verifyEquivalence: осиротевший *-local без базового пресета — строка о неразрешении, а не подменённый референс", () => {
+  const old = {
+    concurrencyPools: { vllm: 1 },
+    sandboxProfiles: { p1: { concurrencyGroup: "vllm" } },
+    presets: { "ghost-local": { model: "vllm/m", sandbox: "p1" } }
+  };
+  const fresh = {
+    presets: {},
+    sandboxServices: [],
+    concurrencyPools: [{ pool: "vllm", limit: 1, models: [{ id: "vllm-m", provider: "vllm", name: "m" }] }]
+  };
+  assert.deepEqual(
+    verifyEquivalence(old, fresh),
+    ["ghost-local: имя больше не разрешается в новой конфигурации (ни пресет, ни пул)."]
+  );
+});
