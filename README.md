@@ -92,6 +92,7 @@ The skill file ([`skills/pi/SKILL.md`](skills/pi/SKILL.md), in Russian) is what 
 | --- | --- |
 | [docs/agents.md](docs/agents.md) | Choosing a model, a system prompt and the tool set; what `presets` prints and why a preset whose equipment will not arrive refuses to run |
 | [docs/config.md](docs/config.md) | Config layers and merge rules, presets, budgets, continuation cache, output ceilings, environment variables |
+| [plugins/pi/config.example.json](plugins/pi/config.example.json) | A whole working fleet to start from — eleven roles, three sandbox services, three pools, every secret and machine path replaced. Copy to `~/.claude/pi/config.json` |
 | [docs/sandbox.md](docs/sandbox.md) | What the container gets, trusted workspaces, profiles and toolchains, images, `--cwd`/`--mount`, concurrency pools |
 | [docs/jobs.md](docs/jobs.md) | Background runs, watching and steering, waiting and notifications, the fleet view, what a run changed |
 | [docs/metrics.md](docs/metrics.md) | The run journal, what `ctx`, `tok/s` and cost actually measure, repeating a run, what the proxy records |

@@ -5,6 +5,8 @@ one repository. The skill keeps only what is needed at launch time.
 
 Optional. `~/.claude/pi/config.json` holds personal defaults, `<repo>/.claude/pi/config.json` project ones — the project file wins, and command-line flags win over both.
 
+**Starting from scratch:** `plugins/pi/config.example.json` is a whole working fleet in the current form — eleven roles, three sandbox services, three provider pools — with every secret and machine path replaced by a placeholder. Copy it to `~/.claude/pi/config.json`, put your own token behind `gitProxy.*.tokenCommand`, point the mounts at paths that exist on your machine, and `pia presets` answers with a fleet instead of nothing. It is generated from a live config, so it stays a working shape rather than a minimal sketch; the config itself is never in this repository (it holds the owner's tokens and decisions).
+
 ```json
 {
   "defaults": { "model": "opencode-go/glm-5.2", "thinking": "medium", "timeoutMs": 1800000 },
