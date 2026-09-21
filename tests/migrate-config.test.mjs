@@ -184,7 +184,7 @@ test("Т-6: сверка проходит по всем 20 старым имен
   const raw = liveFleet();
   const { config } = migrateConfig(raw);
   assert.equal(Object.keys(raw.presets).length, 20);
-  assert.deepEqual(verifyEquivalence(raw, config), []);
+  assert.deepEqual(verifyEquivalence(raw, config, declaredDivergences()), []);
 });
 
 test("Т-6: подмена thinking на записи модели — отказ с перечнем", () => {
@@ -290,7 +290,7 @@ test("Т-8: скрипт не пишет в исходник; пишет тол�
   assert.equal(fs.readFileSync(src, "utf8"), before, "input untouched through the hardlink");
 
   // Эквивалентность предложенной формы доказана на этой же копии.
-  const problems = verifyEquivalence(JSON.parse(before), written);
+  const problems = verifyEquivalence(JSON.parse(before), written, declaredDivergences());
   assert.deepEqual(problems, []);
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -333,7 +333,7 @@ test("фикс: различие по mounts — отказ, а не схлоп�
 test("фикс: группа слотов каждого старого имени равна пулу его модели; расхождение — отказ", () => {
   const raw = liveFleet();
   const { config } = migrateConfig(raw);
-  assert.deepEqual(verifyEquivalence(raw, config), []);
+  assert.deepEqual(verifyEquivalence(raw, config, declaredDivergences()), []);
 
   // Владелец перепутал группу у deepseek-профиля: старое имя go-developer-deepseek
   // считало слоты по группе deepseek, а модель уезжает в пул deepseek — расхождение
@@ -364,7 +364,7 @@ test("фикс: группа слотов каждого старого имен
 test("фикс-раунд 2: теги остаются у роли, записи их не налипают на чужие имена и не дублируются", () => {
   const raw = liveFleet();
   const { config } = migrateConfig(raw);
-  assert.deepEqual(verifyEquivalence(raw, config), []);
+  assert.deepEqual(verifyEquivalence(raw, config, declaredDivergences()), []);
   const byId = Object.fromEntries(config.presets.map((preset) => [preset.id, preset]));
   assert.deepEqual(byId["python-qa"].tags, ["qa", "py"]);
   assert.deepEqual(byId["go-developer"].tags, ["dev", "go"]);
@@ -419,7 +419,7 @@ test("общая часть тегов роли остаётся у пресет
 test("фикс-раунд 2: thinking одиночки берётся из него самого, конфликт записи решается в пользу роли", () => {
   const raw = liveFleet();
   const { config } = migrateConfig(raw);
-  assert.deepEqual(verifyEquivalence(raw, config), []);
+  assert.deepEqual(verifyEquivalence(raw, config, declaredDivergences()), []);
   const researcher = config.presets.find((preset) => preset.id === "researcher");
   assert.equal(researcher.thinking, "high", "researcher keeps its own level, not the family-built record's low");
   const coverage = config.presets.find((preset) => preset.id === "coverage-auditor");
@@ -435,12 +435,23 @@ test("фикс-раунд 2: thinking одиночки берётся из не�
 test("фикс-раунд 2: env роли переезжает на пресет новой формы, у qa — свой test-only-guard", () => {
   const raw = liveFleet();
   const { config } = migrateConfig(raw);
-  assert.deepEqual(verifyEquivalence(raw, config), []);
+  assert.deepEqual(verifyEquivalence(raw, config, declaredDivergences()), []);
   const go = config.presets.find((preset) => preset.id === "go-developer");
   assert.equal(go.sandbox, undefined, "role env rides the sandboxService object, not the old field");
   assert.equal(go.sandboxService.id, "agent");
   assert.ok(go.sandboxService.env.includes("PI_HOOKS=commit-guard,secret-guard"));
-  assert.ok(go.sandboxService.env.includes("GIT_CONFIG_KEY_0=credential.go-developer"));
+  // Git-настройки переехали в сервис agent-base: у роли только PI_HOOKS.
+  assert.equal(
+    go.sandboxService.env.some((entry) => /^GIT_CONFIG_/.test(String(entry))),
+    false,
+    "the role keeps no git settings"
+  );
+  const gitBase = config.sandboxServices.find((service) => service.id === "agent-base");
+  assert.ok(gitBase.env.includes("GIT_CONFIG_COUNT=2"));
+  assert.ok(gitBase.env.includes("GIT_CONFIG_KEY_0=core.hooksPath"));
+  assert.ok(gitBase.env.includes("GIT_CONFIG_VALUE_0=/pi-githooks"));
+  assert.ok(gitBase.env.includes("GIT_CONFIG_KEY_1=commit.gpgsign"));
+  assert.ok(gitBase.env.includes("GIT_CONFIG_VALUE_1=false"));
   const qa = config.presets.find((preset) => preset.id === "go-qa");
   assert.ok(
     qa.sandboxService.env.includes("PI_HOOKS=commit-guard,secret-guard,test-only-guard"),
@@ -448,6 +459,11 @@ test("фикс-раунд 2: env роли переезжает на пресет
   );
   const reviewer = config.presets.find((preset) => preset.id === "reviewer");
   assert.equal(reviewer.sandboxService.id, "agent", "the single's own env rides the object form too");
+  // Роли, у которых hooksPath не было, теперь его получают — это названо
+  // одной строкой громкого списка и закрывает поле sandbox в сверке.
+  const hooksDeclared = declaredDivergences().find((entry) => entry.reason.includes("core.hooksPath"));
+  assert.ok(hooksDeclared, "the gaining-roles divergence is declared loudly");
+  assert.deepEqual(hooksDeclared.presets.sort(), [...new Set(hooksDeclared.presets)].sort());
 });
 
 test("фикс: concurrencyGroup на пресете снимается, назван в dropped, и его нет нигде в выходном документе", () => {
@@ -459,7 +475,7 @@ test("фикс: concurrencyGroup на пресете снимается, наз�
     dropped.some((line) => line.includes("go-developer-zai.concurrencyGroup")),
     `the removal must be named, got: ${dropped.join(" | ")}`
   );
-  assert.deepEqual(verifyEquivalence(raw, config), []);
+  assert.deepEqual(verifyEquivalence(raw, config, declaredDivergences()), []);
 });
 
 // Фикс-раунд 3: двусмысленный провайдер и сверка по фактическому пулу варианта.
@@ -597,4 +613,67 @@ test("фикс-раунд 3: неизвестный флаг и второй п�
   assert.equal(fs.readdirSync(dir).sort().join(","), "config.json", "nothing written on any usage error");
   assert.equal(fs.readFileSync(src, "utf8"), before);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// Правка 3 (решение владельца): git-настройки — общие для ВСЕХ ролей и живут
+// ОДИН РАЗ в сервисе agent-base. Фикстура воспроизводит живую раскладку:
+// hooksPath был у python-семейства и одной web-роли, у go его не было вовсе.
+test("git-настройки переезжают в agent-base один раз; у роли остаётся PI_HOOKS; получившие hooksPath названы одной строкой", () => {
+  const raw = liveFleet();
+  const withHooks = (preset) => ({
+    ...preset,
+    sandbox: {
+      ...preset.sandbox,
+      env: [
+        ...preset.sandbox.env.filter((entry) => !/^GIT_CONFIG_/.test(String(entry))),
+        "GIT_CONFIG_COUNT=2",
+        "GIT_CONFIG_KEY_0=core.hooksPath",
+        "GIT_CONFIG_VALUE_0=/pi-githooks",
+        "GIT_CONFIG_KEY_1=commit.gpgsign",
+        "GIT_CONFIG_VALUE_1=false"
+      ]
+    }
+  });
+  for (const name of ["python-developer-zai", "python-developer-deepseek", "python-developer-local", "web-developer-zai"]) {
+    raw.presets[name] = withHooks(raw.presets[name]);
+  }
+
+  const { config } = migrateConfig(raw);
+  // Полный набор — в базе, один источник: позиционный протокол не терпит
+  // второго владельца GIT_CONFIG_COUNT.
+  const gitBase = config.sandboxServices.find((service) => service.id === "agent-base");
+  assert.ok(gitBase, "agent-base exists");
+  assert.ok(gitBase.env.includes("GIT_CONFIG_COUNT=2"));
+  assert.ok(gitBase.env.includes("GIT_CONFIG_KEY_0=core.hooksPath"));
+  assert.ok(gitBase.env.includes("GIT_CONFIG_VALUE_0=/pi-githooks"));
+  assert.ok(gitBase.env.includes("GIT_CONFIG_KEY_1=commit.gpgsign"));
+  assert.ok(gitBase.env.includes("GIT_CONFIG_VALUE_1=false"));
+
+  // У ролей — только их PI_HOOKS, git-записей нет нигде.
+  const go = config.presets.find((preset) => preset.id === "go-developer");
+  const py = config.presets.find((preset) => preset.id === "python-developer");
+  for (const [label, preset] of [["go", go], ["python", py]]) {
+    assert.equal(
+      preset.sandboxService.env.some((entry) => /^GIT_CONFIG_/.test(String(entry))),
+      false,
+      `${label}: the role keeps no git settings`
+    );
+    assert.ok(preset.sandboxService.env.some((entry) => entry.startsWith("PI_HOOKS=")));
+  }
+
+  // Прежнее различие web-developer-local исчезло (env членов выровнялся),
+  // а получение hooksPath теми, у кого его не было, названо одной строкой.
+  const declared = declaredDivergences();
+  assert.ok(
+    declared.every((entry) => !entry.reason.includes("env членов семейства различался")),
+    "the old per-member env divergence is gone"
+  );
+  // DECLARED копится за весь процесс — берём самую свежую запись (эта миграция).
+  const hooks = [...declared].reverse().find((entry) => entry.reason.includes("core.hooksPath"));
+  assert.ok(hooks, "the gaining-roles divergence is declared");
+  assert.match(hooks.preset, /роли: /);
+  assert.ok(hooks.presets.includes("go-developer-zai") && hooks.presets.includes("reviewer"));
+  assert.ok(!hooks.presets.includes("python-developer-zai"), "roles that had hooksPath are not named");
+  // Сверка принимает изменение ровно по названным старым именам и полю sandbox.
+  assert.deepEqual(verifyEquivalence(raw, config, declaredDivergences()), []);
 });

@@ -350,6 +350,21 @@ function buildServices(config) {
  */
 const DECLARED = [];
 
+/**
+ * Git-настройки переносятся ОДИН РАЗ в сервис agent-base, полным набором —
+ * у роли их быть не должно (см. carrySandbox): протокол позиционный, слияние
+ * по имени переменной, второй источник дал бы затёртый COUNT и KEY_0.
+ */
+const GIT_ENV_ENTRY_RE = /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)=/;
+const GIT_BASE_SERVICE = "agent-base";
+const GIT_BASE_ENV = [
+  "GIT_CONFIG_COUNT=2",
+  "GIT_CONFIG_KEY_0=core.hooksPath",
+  "GIT_CONFIG_VALUE_0=/pi-githooks",
+  "GIT_CONFIG_KEY_1=commit.gpgsign",
+  "GIT_CONFIG_VALUE_1=false"
+];
+
 /** Копия объявленных расхождений: тест обязан проверять, что различие НАЗВАНО. */
 export function declaredDivergences() {
   return DECLARED.map((entry) => ({ ...entry }));
@@ -381,9 +396,15 @@ function sandboxExtrasOf(sandbox) {
 
 /**
  * Перенос ссылки на песочницу в новую форму: ссылка всегда каноничная
- * `sandboxService`; собственные поля роли (env с PI_HOOKS и GIT_CONFIG_*)
- * требуют объектной формы `{id: <сервис>, ...env}` — только так
- * `normalizeSandbox` соберёт тот же контур, что был у старого имени.
+ * `sandboxService`; собственные поля роли (env с PI_HOOKS) требуют объектной
+ * формы `{id: <сервис>, ...env}` — только так `normalizeSandbox` соберёт тот
+ * же контур, что был у старого имени.
+ *
+ * Git-настройки (GIT_CONFIG_COUNT/KEY_N/VALUE_N) из env роли УБИРАЮТСЯ: это
+ * позиционный протокол, слияние идёт по имени переменной, и роль со своими
+ * записями рядом с сервисом затёрла бы COUNT и KEY_0 — обрезанная git-конфига.
+ * Полный набор (hooksPath + gpgsign) живёт в ОДНОМ месте — сервисе agent-base
+ * (см. migrateConfig), а у роли остаётся только её PI_HOOKS.
  */
 function carrySandbox(preset, serviceOf, label) {
   const service = serviceOf.get(profileNameOf(preset.sandbox) ?? "");
@@ -391,6 +412,17 @@ function carrySandbox(preset, serviceOf, label) {
     throw new Error(`${label}: sandbox profile "${JSON.stringify(preset.sandbox)}" is not defined.`);
   }
   const extras = sandboxExtrasOf(preset.sandbox);
+  if (extras?.env) {
+    const env = extras.env.filter((entry) => !GIT_ENV_ENTRY_RE.test(String(entry)));
+    if (env.length) {
+      extras.env = env;
+    } else {
+      delete extras.env;
+    }
+    if (!Object.keys(extras).length) {
+      return { sandboxService: service };
+    }
+  }
   return { sandboxService: extras ? { id: service, ...extras } : service };
 }
 
@@ -408,8 +440,22 @@ function buildFamily(role, members, priorities, serviceOf) {
   }
 
   // Собственный env роли у всех членов семейства общий (это env РОЛИ, а не
-  // провайдера); расхождение — признак того, что схлопывать нельзя.
-  const extrasList = entries.map((member) => sandboxExtrasOf(member.preset.sandbox) ?? {});
+  // провайдера); расхождение — признак того, что схлопывать нельзя. Сравниваются
+  // добавки УЖЕ без git-записей: они снимаются с ролей в любом случае (уходят в
+  // agent-base), и различие только в них схлопыванию не мешает — в живой
+  // конфигурации именно так различался web-developer-local.
+  const stripGit = (extras) => {
+    if (!extras?.env) {
+      return extras;
+    }
+    const env = extras.env.filter((entry) => !GIT_ENV_ENTRY_RE.test(String(entry)));
+    const rest = { ...extras, env };
+    if (!env.length) {
+      delete rest.env;
+    }
+    return rest;
+  };
+  const extrasList = entries.map((member) => stripGit(sandboxExtrasOf(member.preset.sandbox)) ?? {});
   // Различие собственного env внутри семейства встречается в живой конфигурации
   // ОДИН раз (у одного члена лишний core.hooksPath, которого нет у братьев), и
   // отказ на этом месте блокирует миграцию целиком. Берём вариант большинства, а
@@ -676,6 +722,46 @@ export function migrateConfig(raw) {
     }
   }
   const { services, serviceOf } = buildServices(config);
+  // Git-настройки действуют для ВСЕХ ролей и живут в одном месте — в базе,
+  // которую все сервисы наследуют. /pi-githooks в этом сервисе уже смонтирован.
+  const gitBase = services.find((service) => service.id === GIT_BASE_SERVICE);
+  if (!gitBase) {
+    throw new Error(
+      `Service "${GIT_BASE_SERVICE}" is not defined: the shared git settings ` +
+        "(core.hooksPath, commit.gpgsign) have nowhere to live, and a per-role copy would collide on GIT_CONFIG_COUNT."
+    );
+  }
+  gitBase.env = [
+    ...(gitBase.env ?? []).filter((entry) => !GIT_ENV_ENTRY_RE.test(String(entry))),
+    ...GIT_BASE_ENV
+  ];
+  // Роли, у которых core.hooksPath не было, теперь его ПОЛУЧАЮТ — это
+  // изменение поведения, владелец его принял осознанно. Объявляется ОДНОЙ
+  // строкой громкого списка, а в сверке эквивалентности закрывает поле sandbox
+  // ровно затронутых старых имён, не ослабляя сравнение для остальных.
+  const roleIdOf = new Map();
+  for (const [role, members] of families) {
+    for (const member of members.values()) {
+      roleIdOf.set(member.name, role);
+    }
+  }
+  for (const name of singles.keys()) {
+    roleIdOf.set(name, name);
+  }
+  const hadHooks = (name) =>
+    (config.presets[name]?.sandbox?.env ?? []).some((entry) =>
+      /^GIT_CONFIG_KEY_\d+=core\.hooksPath$/.test(String(entry))
+    );
+  const gainingHooks = [...roleIdOf.keys()].filter((name) => !hadHooks(name));
+  if (gainingHooks.length) {
+    const roles = [...new Set(gainingHooks.map((name) => roleIdOf.get(name)))];
+    DECLARED.push({
+      preset: `роли: ${roles.join(", ")}`,
+      field: "sandbox",
+      reason: "core.hooksPath=/pi-githooks перенесён в сервис agent-base и теперь действует для всех ролей — у перечисленных его не было; поведение меняется осознанно",
+      presets: gainingHooks
+    });
+  }
   const { poolsOut } = buildPools(config, poolOrder);
   const priorities = new Map(poolsOut.map((pool) => [pool.pool, pool.priority]));
 
@@ -745,8 +831,15 @@ export function verifyEquivalence(oldRaw, newRaw, declared = []) {
   const problems = [];
   // Объявленное расхождение не ошибка и не совпадение: его печатает отдельный
   // громкий список, поэтому здесь оно молча пропускается ровно по своей паре
-  // «пресет + поле», а не по пресету целиком.
-  const accepted = new Set(declared.map((entry) => `${entry.preset}|${entry.field}`));
+  // «пресет + поле», а не по пресету целиком. Одна запись может объявлять
+  // сразу несколько старых имён (поле `presets`) — например, общую для всех
+  // ролей передачу git-настроек сервису.
+  const accepted = new Set();
+  for (const entry of declared) {
+    for (const preset of entry.presets ?? [entry.preset]) {
+      accepted.add(`${preset}|${entry.field}`);
+    }
+  }
 
   for (const name of Object.keys(old.presets ?? {})) {
     let reference = resolvePresetReference(fresh, name);
@@ -841,6 +934,12 @@ export function verifyEquivalence(oldRaw, newRaw, declared = []) {
       delete full.concurrencyGroup;
       if (grouped) {
         delete full.maxConcurrent;
+      }
+      // env сравнивается как множество name=value: порядок переменных семантики
+      // не несёт, а после переноса git-записей в agent-base он и не может
+      // совпасть байт-в-байт — набор обязан, порядок нет.
+      if (Array.isArray(full.env)) {
+        full.env = [...full.env].sort();
       }
       delete full.profileName;
       return full;
@@ -1026,11 +1125,12 @@ export async function main(argv) {
   if (DECLARED.length) {
     process.stdout.write(
       "ВНИМАНИЕ — осознанно снятые различия (решение за владельцем):\n" +
-        DECLARED.map(
-          (entry) =>
-            `  - ${entry.preset}: ${entry.reason}\n` +
-            `      было: ${JSON.stringify(entry.was)}\n` +
-            `      стало: ${JSON.stringify(entry.now)}`
+        DECLARED.map((entry) =>
+          entry.was === undefined && entry.now === undefined
+            ? `  - ${entry.preset}: ${entry.reason}`
+            : `  - ${entry.preset}: ${entry.reason}\n` +
+              `      было: ${JSON.stringify(entry.was)}\n` +
+              `      стало: ${JSON.stringify(entry.now)}`
         ).join("\n") +
         "\n\n"
     );
