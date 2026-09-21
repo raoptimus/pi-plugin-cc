@@ -5,6 +5,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { normalizeConfigLayer } from "../plugins/pi/scripts/lib/config.mjs";
+// buildVariants lives in the big CLI module; importing it pulls the whole file,
+// which is fine under node --test and keeps the variant path honest.
 import { listSandboxImages, normalizeSandbox } from "../plugins/pi/scripts/lib/sandbox.mjs";
 
 /**
@@ -54,6 +56,20 @@ test("the example config loads in the current form", () => {
   // or a copied config fails at the first run instead of at review time.
   for (const entry of listSandboxImages(config)) {
     assert.match(entry.image, /^[\w.-]+(:[\w.-]+)?$/, `image tag ${entry.image} is well formed`);
+  }
+});
+
+test("a role of the new form gets the slots of its model's pool", async () => {
+  const { buildVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
+
+  const config = normalizeConfigLayer(parsed);
+  const { variants } = buildVariants(config.presets["go-developer"], config);
+  assert.ok(variants.length >= 2, "the role lists several candidate models");
+  for (const variant of variants) {
+    const pool = config.concurrencyPools[variant.pool];
+    assert.ok(pool, `model ${variant.id} sits in pool ${variant.pool}, which exists`);
+    assert.equal(variant.sandbox.poolName, variant.pool, "the sandbox is scoped by the model's pool");
+    assert.equal(variant.sandbox.maxConcurrent, Number(pool.limit), "slots come from that pool's limit");
   }
 });
 

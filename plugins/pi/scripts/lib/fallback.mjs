@@ -54,10 +54,11 @@ export function classifyFailure(text) {
 }
 
 /**
- * The slot pool a preset draws from: the concurrency group of its sandbox
- * profile, or the profile's own name when it groups nothing. Two presets on
- * one pool hit the same provider allowance, which is what makes the pool —
- * not the preset — the unit a busy slot message speaks about.
+ * The slot pool a preset draws from, by its profile's own name. A preset whose
+ * selected model belongs to a pool is scoped by that pool at variant build
+ * time, so here the profile name is the only remaining grouping. Two presets
+ * on one profile hit the same provider allowance, which is what makes the
+ * pool — not the preset — the unit a busy slot message speaks about.
  */
 export function presetPool(preset, config) {
   let sandbox;
@@ -66,7 +67,7 @@ export function presetPool(preset, config) {
   } catch {
     return null;
   }
-  return sandbox?.concurrencyGroup ?? sandbox?.profileName ?? null;
+  return sandbox?.profileName ?? null;
 }
 
 /**

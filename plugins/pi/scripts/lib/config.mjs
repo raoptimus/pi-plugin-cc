@@ -43,8 +43,8 @@ const BUILT_IN = {
   // Named sandbox profiles: the toolchain an agent needs inside the container
   // (mounted binaries, PATH, gate extensions), referenced by `"sandbox": "go"`.
   sandboxProfiles: {},
-  // Named slot pools: `{"ollama-pro": 3}` means every profile that declares
-  // `"concurrencyGroup": "ollama-pro"` draws from the same three slots. Optional
+  // Named slot pools: `{"ollama-pro": 3}` means every preset whose selected
+  // model's record sits in that pool draws from the same three slots. Optional
   // — a profile can also cap itself with `maxConcurrent` and share nothing.
   // A pool may also be a full object: `{limit, priority, models}` —
   // the models being an array of records `{id, provider, name,
@@ -160,6 +160,7 @@ function normalizePreset(preset, name) {
       'Name one sandbox for the role with "sandboxService"; the pool of the selected model provides the slots.'
     );
   }
+
   if (preset.models !== undefined && !Array.isArray(preset.models)) {
     throw new Error(`Preset "${name}" has "models" that is not an array of model ids.`);
   }
@@ -223,6 +224,7 @@ export function normalizeConfigLayer(layer) {
     delete clean.sandboxServices;
   }
 
+
   if (Array.isArray(clean.concurrencyPools)) {
     clean.concurrencyPools = normalizeNamedArray(clean.concurrencyPools, "concurrencyPools", "pool");
   }
@@ -245,6 +247,40 @@ export function normalizeConfigLayer(layer) {
     clean.presets = presets;
   }
   return clean;
+}
+
+/**
+ * Refuse the removed `concurrencyGroup` field on a normalized layer.
+ *
+ * Lives outside `normalizeConfigLayer` on purpose: the migrator
+ * (`migrate-config.mjs`) reads the OLD form and reuses the normalizer, so a
+ * refusal there would break migration of other machines' configs. This check
+ * runs only on the plugin's own config load, where the field can no longer
+ * mean anything — and refuses instead of ignoring, because a silently ignored
+ * field leaves a config that looks tuned and does not work.
+ */
+export function refuseRemovedConcurrencyGroup(layer) {
+  if (!isPlainObject(layer)) {
+    return;
+  }
+  for (const [name, profile] of Object.entries(layer.sandboxProfiles ?? {})) {
+    if (isPlainObject(profile) && profile.concurrencyGroup !== undefined) {
+      refuseRemovedField(
+        `Sandbox profile "${name}"`,
+        "concurrencyGroup",
+        'The pool is determined by the selected model\'s entry in "concurrencyPools" — remove the field.'
+      );
+    }
+  }
+  for (const [name, preset] of Object.entries(layer.presets ?? {})) {
+    if (isPlainObject(preset) && preset.concurrencyGroup !== undefined) {
+      refuseRemovedField(
+        `Preset "${preset.id ?? name}"`,
+        "concurrencyGroup",
+        'The pool is determined by the selected model\'s entry in "concurrencyPools" — list model ids under "models" and remove the field.'
+      );
+    }
+  }
 }
 
 /**
@@ -779,6 +815,7 @@ export function loadConfig(workspaceRoot) {
     // Owner-form arrays become maps before any merging: `mergeConfigLayer`
     // merges named blocks entry by entry, and an array would replace the block
     // whole — a project layer adding one pool would wipe the user's.
+        refuseRemovedConcurrencyGroup(user.value);
     config = mergeConfigLayer(config, normalizeConfigLayer(user.value));
   }
 
@@ -793,6 +830,7 @@ export function loadConfig(workspaceRoot) {
     // Normalized first: the sanitizer walks maps (`sandboxProfiles`,
     // `concurrencyPools`), and a raw owner-form array would slip past it —
     // exactly the mounts a service names would then reach docker untouched.
+        refuseRemovedConcurrencyGroup(project.value);
     const normalized = normalizeConfigLayer(project.value);
     const layer = trusted ? stripHostExecution(normalized, warnings) : sanitizeProjectLayer(normalized, warnings);
     config = mergeConfigLayer(config, layer);

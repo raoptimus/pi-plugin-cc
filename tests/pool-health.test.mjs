@@ -276,7 +276,7 @@ test("settlePoolHealth: success erases, pool death records, task error leaves st
   const { settlePoolHealth } = await import("../plugins/pi/scripts/pi-companion.mjs");
   await withIsolatedState(async () => {
     const settings = (pool) => ({
-      sandbox: { concurrencyGroup: pool },
+      sandbox: { poolName: pool },
       poolCooldowns: COOLDOWNS
     });
 
@@ -313,7 +313,7 @@ test("settlePoolHealth: success erases, pool death records, task error leaves st
 
     // No pool in play: nothing read, nothing written.
     const before = JSON.stringify(readPoolHealth());
-    settlePoolHealth({ sandbox: { concurrencyGroup: "ghost" } }, { exitStatus: 1, errors: ["402"] }, null);
+    settlePoolHealth({ sandbox: { poolName: "ghost" } }, { exitStatus: 1, errors: ["402"] }, null);
     assert.equal(JSON.stringify(readPoolHealth()), before, "cooldowns unset means the run is not pool-shaped");
   });
 });

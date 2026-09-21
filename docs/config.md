@@ -81,7 +81,7 @@ All three blocks are written as **arrays** (the entry's `id`/`pool` is its key);
 - **`samplingParams` of the chosen model** travel into the credential proxy and take precedence over the same keys in `~/.pi/agent/models.json`: the plugin config is the more specific source. A model without them behaves exactly as before.
 - **Old names keep working.** `go-developer-zai` resolves to the `go-developer` preset pinned to the pool the tail names — by pool name or by a model id of the preset. Pool `aliases` are removed: `*-local` does not resolve anymore (the pool is and was named `vllm`), and a pool carrying `aliases` is refused. An unmatched tail is a refusal, not a silent fall-back. `--model <id>` or `--model provider/name` addresses one model directly, past busy-pool skipping; anything else stays a literal model override.
 
-Today's shapes remain supported: `presets` and `sandboxProfiles` as maps, `concurrencyPools: {"zai": 7}` (a bare number of slots for profiles declaring `"concurrencyGroup": "zai"`), `sandbox` as a profile name or object.
+Today's shapes remain supported: `presets` and `sandboxProfiles` as maps, `concurrencyPools: {"zai": 7}` (a bare number of slots read as `{"limit": 7}`), `sandbox` as a profile name or object. The `concurrencyGroup` field is removed: a config declaring it is refused — the pool is determined by the selected model's entry in `concurrencyPools`, so a preset lists model ids under `models` instead.
 
 ## Budgets: stopping a run that costs too much
 
