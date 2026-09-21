@@ -736,6 +736,20 @@ export function migrateConfig(raw) {
   const poolOrder = [...poolNames].sort((a, b) => (a === "vllm" ? 1 : 0) - (b === "vllm" ? 1 : 0));
 
   const { families, singles } = groupByRole(config.presets, config.concurrencyPools ?? {});
+  // A single named exactly like a family's role collides with the family's
+  // collapsed id: presets "dev" and "dev-vllm" would both emit id "dev" and
+  // die later in the normalizer with a raw `Duplicate id "dev"` that names
+  // neither source. Refuse here, naming both names and the way out.
+  for (const [role, members] of families) {
+    if (singles.has(role)) {
+      const familyNames = [...members.values()].map((member) => `"${member.name}"`).join(", ");
+      throw new Error(
+        `Presets "${role}" and ${familyNames} would all collapse into preset id "${role}": ` +
+          `"${role}" is read as a standalone preset, while the others read as the role "${role}" pinned to a pool. ` +
+          "Rename one of them."
+      );
+    }
+  }
   const { services, serviceOf } = buildServices(config);
   const { poolsOut } = buildPools(config, poolOrder);
   const priorities = new Map(poolsOut.map((pool) => [pool.pool, pool.priority]));

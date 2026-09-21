@@ -208,6 +208,22 @@ test("Т-7: model2 снят и назван", () => {
   assert.match(dropped[0], /python-developer-deepseek\.model2/);
 });
 
+test("Т-8: одиночка с именем роли семейства — внятный отказ с обоими именами", () => {
+  const raw = liveFleet();
+  // "reviewer-local" читается как роль "reviewer" с пулом, а "reviewer" — как
+  // одиночка: оба схлопываются в id "reviewer".
+  raw.presets["reviewer-local"] = { model: "vllm/Qwen3.8-27B", thinking: "off", sandbox: raw.presets.reviewer.sandbox };
+  assert.throws(
+    () => migrateConfig(raw),
+    (error) => {
+      assert.match(error.message, /"reviewer" and "reviewer-local".*collapse into preset id "reviewer"/);
+      assert.match(error.message, /Rename one of them/);
+      return true;
+    },
+    "the refusal names both presets and the fix"
+  );
+});
+
 test("Т-8: --out пишет копию с правами 0600, как вход с секретом", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "migrate-mode-"));
   const src = path.join(dir, "config.json");
