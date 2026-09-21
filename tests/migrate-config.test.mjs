@@ -96,8 +96,9 @@ test("Т-2: семейство схлопывается в один пресет
   // Общая часть один раз: ни model, ни per-провайдерных полей в пресете нет.
   assert.equal(go.model, undefined);
   // У роли есть собственный env, поэтому песочница переносится объектной формой
-  // поверх сервиса; сам сервис — "agent".
-  assert.equal(go.sandbox.profile, "agent");
+  // `{id: <сервис>, ...env}` поверх сервиса; сам сервис — "agent".
+  assert.equal(go.sandboxService.id, "agent");
+  assert.ok(go.sandboxService.env.includes("PI_HOOKS=commit-guard,secret-guard"));
   assert.equal(go.systemPrompt, "@dev");
   assert.deepEqual(go.tags, ["dev", "go"]);
   // Различавшиеся thinking — на записях моделей. С решателем по всем
@@ -429,14 +430,17 @@ test("фикс-раунд 2: env роли переезжает на пресет
   const { config } = migrateConfig(raw);
   assert.deepEqual(verifyEquivalence(raw, config), []);
   const go = config.presets.find((preset) => preset.id === "go-developer");
-  assert.equal(go.sandboxService, undefined, "role env cannot ride the service field");
-  assert.equal(go.sandbox.profile, "agent");
-  assert.ok(go.sandbox.env.includes("PI_HOOKS=commit-guard,secret-guard"));
-  assert.ok(go.sandbox.env.includes("GIT_CONFIG_KEY_0=credential.go-developer"));
+  assert.equal(go.sandbox, undefined, "role env rides the sandboxService object, not the old field");
+  assert.equal(go.sandboxService.id, "agent");
+  assert.ok(go.sandboxService.env.includes("PI_HOOKS=commit-guard,secret-guard"));
+  assert.ok(go.sandboxService.env.includes("GIT_CONFIG_KEY_0=credential.go-developer"));
   const qa = config.presets.find((preset) => preset.id === "go-qa");
-  assert.ok(qa.sandbox.env.includes("PI_HOOKS=commit-guard,secret-guard,test-only-guard"), "qa keeps its own hook set");
+  assert.ok(
+    qa.sandboxService.env.includes("PI_HOOKS=commit-guard,secret-guard,test-only-guard"),
+    "qa keeps its own hook set"
+  );
   const reviewer = config.presets.find((preset) => preset.id === "reviewer");
-  assert.equal(reviewer.sandbox.profile, "agent", "a single preset carries its own env too");
+  assert.equal(reviewer.sandboxService.id, "agent", "the single's own env rides the object form too");
 });
 
 test("фикс: concurrencyGroup на пресете снимается, назван в dropped, и его нет нигде в выходном документе", () => {

@@ -381,10 +381,10 @@ function sandboxExtrasOf(sandbox) {
 }
 
 /**
- * Перенос ссылки на песочницу в новую форму: чистая ссылка на профиль даёт
- * каноничную `sandboxService`; собственные поля роли (env) требуют объектной
- * формы `{profile: <сервис>, ...env}` — только так `normalizeSandbox` соберёт
- * тот же контур, что был у старого имени.
+ * Перенос ссылки на песочницу в новую форму: ссылка всегда каноничная
+ * `sandboxService`; собственные поля роли (env с PI_HOOKS и GIT_CONFIG_*)
+ * требуют объектной формы `{id: <сервис>, ...env}` — только так
+ * `normalizeSandbox` соберёт тот же контур, что был у старого имени.
  */
 function carrySandbox(preset, serviceOf, label) {
   const service = serviceOf.get(profileNameOf(preset.sandbox) ?? "");
@@ -392,7 +392,7 @@ function carrySandbox(preset, serviceOf, label) {
     throw new Error(`${label}: sandbox profile "${JSON.stringify(preset.sandbox)}" is not defined.`);
   }
   const extras = sandboxExtrasOf(preset.sandbox);
-  return extras ? { sandbox: { profile: service, ...extras } } : { sandboxService: service };
+  return { sandboxService: extras ? { id: service, ...extras } : service };
 }
 
 function buildFamily(role, members, priorities, serviceOf) {

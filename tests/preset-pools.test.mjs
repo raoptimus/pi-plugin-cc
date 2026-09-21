@@ -373,6 +373,64 @@ test("an unknown model id or service is refused with what is known, and provider
   );
 });
 
+// sandboxService допускает объект: роль несёт СВОИ добавки (pi-хуки набором,
+// GIT_CONFIG_*), и им нужно место рядом с сервисом. Контур обязан совпасть со
+// старой формой `sandbox: {profile, env}` — списки роли складываются с
+// сервисом, скаляры перекрывают.
+test("a sandboxService object folds into the service with the role's additions, same contour as the old sandbox form", async () => {
+  const { normalizeConfigLayer } = await import("../plugins/pi/scripts/lib/config.mjs");
+  const { normalizeSandbox } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
+
+  const contour = (config, sandbox) => {
+    const full = normalizeSandbox(sandbox, config.sandboxProfiles ?? {});
+    delete full.profileName;
+    return full;
+  };
+
+  const rawObject = ownerFormConfig();
+  rawObject.presets.find((p) => p.id === "role").sandboxService = {
+    id: "agent",
+    env: ["PI_HOOKS=go-cache-guard", "GIT_CONFIG_COUNT=1"],
+    mounts: ["/srv/role:/role:ro"]
+  };
+  const objectForm = normalizeConfigLayer(rawObject);
+  const rawOld = ownerFormConfig();
+  delete rawOld.presets.find((p) => p.id === "role").sandboxService;
+  rawOld.presets.find((p) => p.id === "role").sandbox = {
+    profile: "agent",
+    env: ["PI_HOOKS=go-cache-guard", "GIT_CONFIG_COUNT=1"],
+    mounts: ["/srv/role:/role:ro"]
+  };
+  const oldForm = normalizeConfigLayer(rawOld);
+
+  // Same allowed contour either way — the object is sugar over the old shape.
+  assert.deepEqual(contour(objectForm, objectForm.presets.role.sandbox), contour(oldForm, oldForm.presets.role.sandbox));
+
+  const resolved = contour(objectForm, objectForm.presets.role.sandbox);
+  // The service's own equipment is still there: the role's lists ADD, not wipe.
+  assert.ok(resolved.env.includes("PATH=/toolchain"), "the base's env survives");
+  assert.ok(resolved.env.includes("EXTRA=1"), "the service's env survives");
+  assert.ok(resolved.env.includes("PI_HOOKS=go-cache-guard"), "the role's env is added on top");
+  assert.ok(resolved.mounts.includes("/srv/base:/base:ro") && resolved.mounts.includes("/srv/role:/role:ro"));
+  assert.deepEqual(resolved.args, ["--cpus", "6", "--security-opt", "no-new-privileges"], "args add positionally");
+
+  // Malformed object: no id to name the service — a refusal, not a guess.
+  assert.throws(
+    () => normalizeConfigLayer({ presets: [{ id: "broken", models: [], sandboxService: { env: ["X=1"] } }] }),
+    /sandboxService.*neither a service id nor an object with a string "id"/
+  );
+  // Unknown service id (object form) — refused with the known list, same as string.
+  assert.throws(
+    () => {
+      const raw = ownerFormConfig();
+      raw.presets.find((p) => p.id === "role").sandboxService = { id: "no-such-service" };
+      const config = normalizeConfigLayer(raw);
+      contour(config, config.presets.role.sandbox);
+    },
+    /Unknown sandbox "no-such-service".*base, agent/
+  );
+});
+
 test("models of one pool share one quota, and a bare number still reads as a limit", async () => {
   const { buildVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
   const { awaitSandboxSlot, describeSlotUsage } = await import("../plugins/pi/scripts/lib/sandbox.mjs");

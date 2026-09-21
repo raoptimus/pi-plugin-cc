@@ -167,7 +167,26 @@ function normalizePreset(preset, name) {
     // The preset's sandbox is a single named service, not per-provider halves.
     // Translated to the field every consumer already reads (capability reports,
     // `--sandbox` overrides, slot accounting) so there is no second path.
-    const translated = { ...preset, sandbox: preset.sandboxService };
+    //
+    // An object form carries the role's own additions (its pi-hook env set,
+    // GIT_CONFIG_*): `{"id": "agent", "env": [...]}` means "the agent service
+    // plus this env", not a service redefinition — exactly how an object
+    // `sandbox: {profile, env}` has always merged. Folding it into that shape
+    // reuses the additive merge instead of opening a second one.
+    const service = preset.sandboxService;
+    if (typeof service === "string") {
+      const translated = { ...preset, sandbox: service };
+      delete translated.sandboxService;
+      return translated;
+    }
+    if (!isPlainObject(service) || typeof service.id !== "string" || !service.id.trim()) {
+      throw new Error(
+        `Preset "${name}" has "sandboxService" that is neither a service id nor an object with a string "id", ` +
+          `got ${JSON.stringify(service ?? null)}.`
+      );
+    }
+    const { id, ...extras } = service;
+    const translated = { ...preset, sandbox: { profile: id, ...extras } };
     delete translated.sandboxService;
     return translated;
   }
