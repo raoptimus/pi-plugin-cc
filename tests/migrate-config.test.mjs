@@ -11,6 +11,15 @@ const SCRIPT = path.resolve(path.dirname(decodeURIComponent(new URL(import.meta.
 
 /** The fleet in its historical shape: 20 presets on 11 roles, five profiles, numeric pools. */
 function liveFleet() {
+  // Живая форма: у КАЖДОГО пресета песочница — объект `{profile, env}` с
+  // пер-ролевым набором: PI_HOOKS роли (у qa добавлен test-only-guard) и
+  // GIT_CONFIG_*. Это env роли, не провайдера — у членов семейства он общий.
+  const roleEnv = (role, qa = false) => [
+    `PI_HOOKS=commit-guard,secret-guard${qa ? ",test-only-guard" : ""}`,
+    "GIT_CONFIG_COUNT=1",
+    `GIT_CONFIG_KEY_0=credential.${role}`
+  ];
+  const sb = (role, profile, qa = false) => ({ profile, env: roleEnv(role, qa) });
   const member = (model, thinking, sandbox, extra = {}) => ({
     model,
     thinking,
@@ -23,10 +32,10 @@ function liveFleet() {
     tags: ["fleet"],
     ...extra
   });
-  const family = (role, zaiSandbox) => ({
-    [`${role}-zai`]: member("zai-coding-cn/glm-5.3-flash", "low", zaiSandbox, { description: `${role} (zai)` }),
-    [`${role}-deepseek`]: member("deepseek/deepseek-v4-flash", "off", "agent-deepseek", { description: `${role} (deepseek)` }),
-    [`${role}-local`]: member("vllm/Qwen3.8-27B", "off", "agent-dind-vllm", { description: `${role} (local)` })
+  const family = (role, zaiProfile, qa = false) => ({
+    [`${role}-zai`]: member("zai-coding-cn/glm-5.3-flash", "low", sb(role, zaiProfile, qa), { description: `${role} (zai)` }),
+    [`${role}-deepseek`]: member("deepseek/deepseek-v4-flash", "off", sb(role, "agent-deepseek", qa), { description: `${role} (deepseek)` }),
+    [`${role}-local`]: member("vllm/Qwen3.8-27B", "off", sb(role, "agent-dind-vllm", qa), { description: `${role} (local)` })
   });
   const dind = { args: ["--security-opt", "seccomp=@dind.json", "--device", "/dev/net/tun"], env: ["PI_DIND=1"], mounts: ["pi-dind:/var/lib/docker"] };
   // The owner's live layout (checked against the real file): the trio
@@ -45,24 +54,24 @@ function liveFleet() {
     concurrencyPools: { zai: 7, deepseek: 7, vllm: 1 },
     presets: {
       ...family("go-developer", "agent-dind"),
-      ...family("go-qa", "agent-dind"),
+      ...family("go-qa", "agent-dind", true),
       ...family("python-developer", "agent-dind"),
-      "python-qa-zai": member("zai-coding-cn/glm-5.3-flash", "low", "agent", { systemPrompt: "@qa" }),
-      "python-qa-local": member("vllm/Qwen3.8-27B", "off", "agent-dind-vllm", { systemPrompt: "@qa" }),
+      "python-qa-zai": member("zai-coding-cn/glm-5.3-flash", "low", sb("python-qa", "agent", true), { systemPrompt: "@qa" }),
+      "python-qa-local": member("vllm/Qwen3.8-27B", "off", sb("python-qa", "agent-dind-vllm", true), { systemPrompt: "@qa" }),
       ...family("web-developer", "agent"),
-      "web-qa-local": member("vllm/Qwen3.8-27B", "off", "agent-dind-vllm", { systemPrompt: "@qa" }),
-      "rust-developer-local": member("vllm/Qwen3.8-27B", "off", "agent-dind-vllm", { systemPrompt: "@dev-rust" }),
-      "rust-qa-local": member("vllm/Qwen3.8-27B", "off", "agent-dind-vllm", { systemPrompt: "@qa-rust" }),
+      "web-qa-local": member("vllm/Qwen3.8-27B", "off", sb("web-qa", "agent-dind-vllm", true), { systemPrompt: "@qa" }),
+      "rust-developer-local": member("vllm/Qwen3.8-27B", "off", sb("rust-developer", "agent-dind-vllm"), { systemPrompt: "@dev-rust" }),
+      "rust-qa-local": member("vllm/Qwen3.8-27B", "off", sb("rust-qa", "agent-dind-vllm", true), { systemPrompt: "@qa-rust" }),
       reviewer: {
         model: "zai-coding-cn/glm-5.3",
         thinking: "high",
         readOnly: true,
-        sandbox: "agent",
+        sandbox: sb("reviewer", "agent"),
         systemPrompt: "reviewer",
         description: "Ревьюер"
       },
-      researcher: { model: "zai-coding-cn/glm-5.3-flash", thinking: "low", sandbox: "agent", systemPrompt: "@research" },
-      "coverage-auditor": { model: "deepseek/deepseek-v4-flash", thinking: "off", sandbox: "agent-deepseek", systemPrompt: "@coverage" },
+      researcher: { model: "zai-coding-cn/glm-5.3-flash", thinking: "low", sandbox: sb("researcher", "agent"), systemPrompt: "@research" },
+      "coverage-auditor": { model: "deepseek/deepseek-v4-flash", thinking: "off", sandbox: sb("coverage-auditor", "agent-deepseek"), systemPrompt: "@coverage" },
     },
     gitProxy: { "github.com": {} }
   };
@@ -83,7 +92,9 @@ test("Т-2: семейство схлопывается в один пресет
   assert.deepEqual(go.models, ["zai-glm-5.3-flash", "deepseek-deepseek-v4-flash", "vllm-Qwen3.8-27B"]);
   // Общая часть один раз: ни model, ни per-провайдерных полей в пресете нет.
   assert.equal(go.model, undefined);
-  assert.equal(go.sandboxService, "agent");
+  // У роли есть собственный env, поэтому песочница переносится объектной формой
+  // поверх сервиса; сам сервис — "agent".
+  assert.equal(go.sandbox.profile, "agent");
   assert.equal(go.systemPrompt, "@dev");
   assert.deepEqual(go.tags, ["fleet"]);
   // Различавшиеся thinking — на записях моделей.
@@ -280,6 +291,23 @@ test("фикс: группа слотов каждого старого имен
   vllm.aliases = [];
   assert.ok(verifyEquivalence(raw, corrupted).some((line) => line.includes("go-developer-local")),
     "breaking the pool alias must be caught for the *-local name");
+});
+
+// Фикс-раунд 2: собственный env роли из объектной песочницы.
+
+test("фикс-раунд 2: env роли переезжает на пресет новой формы, у qa — свой test-only-guard", () => {
+  const raw = liveFleet();
+  const { config } = migrateConfig(raw);
+  assert.deepEqual(verifyEquivalence(raw, config), []);
+  const go = config.presets.find((preset) => preset.id === "go-developer");
+  assert.equal(go.sandboxService, undefined, "role env cannot ride the service field");
+  assert.equal(go.sandbox.profile, "agent");
+  assert.ok(go.sandbox.env.includes("PI_HOOKS=commit-guard,secret-guard"));
+  assert.ok(go.sandbox.env.includes("GIT_CONFIG_KEY_0=credential.go-developer"));
+  const qa = config.presets.find((preset) => preset.id === "go-qa");
+  assert.ok(qa.sandbox.env.includes("PI_HOOKS=commit-guard,secret-guard,test-only-guard"), "qa keeps its own hook set");
+  const reviewer = config.presets.find((preset) => preset.id === "reviewer");
+  assert.equal(reviewer.sandbox.profile, "agent", "a single preset carries its own env too");
 });
 
 test("фикс: concurrencyGroup на пресете снимается, назван в dropped, и его нет нигде в выходном документе", () => {

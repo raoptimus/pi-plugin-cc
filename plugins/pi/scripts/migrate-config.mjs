@@ -325,6 +325,35 @@ function profileNameOf(sandbox) {
   return null;
 }
 
+/**
+ * Собственные поля песочницы пресета поверх профиля (`env` с пер-ролевыми
+ * PI_HOOKS и GIT_CONFIG_*). Это ИМУЩЕСТВО РОЛИ, а не сервиса: сервис описывает
+ * контейнер, набор хуков — роль, поэтому переносить его нужно на пресет, а не
+ * вливать в общий sandboxService.
+ */
+function sandboxExtrasOf(sandbox) {
+  if (!isPlainObject(sandbox)) {
+    return null;
+  }
+  const { profile, ...rest } = sandbox;
+  return Object.keys(rest).length ? rest : null;
+}
+
+/**
+ * Перенос ссылки на песочницу в новую форму: чистая ссылка на профиль даёт
+ * каноничную `sandboxService`; собственные поля роли (env) требуют объектной
+ * формы `{profile: <сервис>, ...env}` — только так `normalizeSandbox` соберёт
+ * тот же контур, что был у старого имени.
+ */
+function carrySandbox(preset, serviceOf, label) {
+  const service = serviceOf.get(profileNameOf(preset.sandbox) ?? "");
+  if (!service) {
+    throw new Error(`${label}: sandbox profile "${JSON.stringify(preset.sandbox)}" is not defined.`);
+  }
+  const extras = sandboxExtrasOf(preset.sandbox);
+  return extras ? { sandbox: { profile: service, ...extras } } : { sandboxService: service };
+}
+
 function buildFamily(role, members, priorities, serviceOf) {
   const entries = [...members.values()];
   const names = entries.map((member) => member.name);
@@ -337,6 +366,17 @@ function buildFamily(role, members, priorities, serviceOf) {
         "Equivalence could not hold for every old name; the profiles must be reconciled by hand."
     );
   }
+
+  // Собственный env роли у всех членов семейства общий (это env РОЛИ, а не
+  // провайдера); расхождение — признак того, что схлопывать нельзя.
+  const extrasList = entries.map((member) => sandboxExtrasOf(member.preset.sandbox) ?? {});
+  if (extrasList.some((extras) => !deepEqual(extras, extrasList[0]))) {
+    throw new Error(
+      `Role "${role}" members carry different sandbox env (${names.join(", ")}) — ` +
+        "the role's own env must be identical across a family for it to collapse."
+    );
+  }
+  const sharedExtras = Object.keys(extrasList[0]).length ? extrasList[0] : null;
 
   const sameForAll = (key) => presets.every((preset) => deepEqual(preset[key], presets[0][key]));
   const common = {};
@@ -393,7 +433,7 @@ function buildFamily(role, members, priorities, serviceOf) {
   const preset = {
     id: role,
     models: ordered.map(([pool, member]) => modelId(pool, splitModel(member.preset.model).name)),
-    sandboxService: serviceOf.get(profileNameOf(entries[0].preset.sandbox) ?? ""),
+    ...carrySandbox(entries[0].preset, serviceOf, `Role "${role}"`),
     ...common
   };
   if (presets.some((preset) => preset.description !== undefined)) {
@@ -435,11 +475,7 @@ function carrySingle(name, preset, serviceOf, poolNames) {
     carried.models = [modelId(pool, split.name)];
   }
   if (preset.sandbox !== undefined) {
-    const service = serviceOf.get(profileNameOf(preset.sandbox) ?? "");
-    if (!service) {
-      throw new Error(`Single preset "${name}": sandbox profile "${preset.sandbox}" is not defined.`);
-    }
-    carried.sandboxService = service;
+    Object.assign(carried, carrySandbox(preset, serviceOf, `Single preset "${name}"`));
   }
   for (const [key, value] of Object.entries(preset)) {
     if (key === "model" || key === "sandbox" || key === "concurrencyGroup") {
@@ -622,8 +658,9 @@ export function verifyEquivalence(oldRaw, newRaw) {
     // pool of the model it resolves to (pool aliases count — `*-local` said
     // `vllm`). Otherwise the migration rewired who counts slots.
     const oldSandbox = old.presets[name]?.sandbox;
-    if (typeof oldSandbox === "string" && old.sandboxProfiles?.[oldSandbox]) {
-      const group = normalizeSandbox(oldSandbox, old.sandboxProfiles ?? {}).concurrencyGroup;
+    const oldSandboxProfile = profileNameOf(oldSandbox);
+    if (oldSandboxProfile && old.sandboxProfiles?.[oldSandboxProfile]) {
+      const group = normalizeSandbox(oldSandboxProfile, old.sandboxProfiles ?? {}).concurrencyGroup;
       if (group != null) {
         const pool = Object.values(fresh.concurrencyPools ?? {}).find((entry) =>
           Object.values(entry.models ?? {}).some((model) => model.provider === variant.provider)
