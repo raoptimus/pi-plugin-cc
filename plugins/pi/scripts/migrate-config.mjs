@@ -305,12 +305,32 @@ function buildServices(config) {
  * prefix. Returns `{ preset, modelOverrides: Map<modelKey, {thinking?, tags?}>
  * }`.
  */
+/**
+ * Имя профиля песочницы, на который ссылается пресет.
+ *
+ * Старая форма допускает и строку (`"sandbox": "agent-dind"`), и объект
+ * (`"sandbox": {"profile": "agent-dind", "env": [...]}`), и живая конфигурация
+ * пользуется ИМЕННО объектной: в ней же лежат пер-ролевые PI_HOOKS. Прежний
+ * `String(preset.sandbox)` на объекте давал "[object Object]", карта сервисов
+ * возвращала undefined, и миграция отказывала на каждой роли живого конфига —
+ * при том что на фикстуре со строковыми ссылками проходила.
+ */
+function profileNameOf(sandbox) {
+  if (typeof sandbox === "string") {
+    return sandbox;
+  }
+  if (isPlainObject(sandbox) && typeof sandbox.profile === "string") {
+    return sandbox.profile;
+  }
+  return null;
+}
+
 function buildFamily(role, members, priorities, serviceOf) {
   const entries = [...members.values()];
   const names = entries.map((member) => member.name);
   const presets = entries.map((member) => member.preset);
 
-  const services = new Set(entries.map((member) => serviceOf.get(String(member.preset.sandbox ?? ""))));
+  const services = new Set(entries.map((member) => serviceOf.get(profileNameOf(member.preset.sandbox) ?? "")));
   if (services.size > 1 || [...services][0] === undefined) {
     throw new Error(
       `Role "${role}" spans sandbox profiles that do not collapse into one service (${names.join(", ")}). ` +
@@ -373,7 +393,7 @@ function buildFamily(role, members, priorities, serviceOf) {
   const preset = {
     id: role,
     models: ordered.map(([pool, member]) => modelId(pool, splitModel(member.preset.model).name)),
-    sandboxService: serviceOf.get(String(entries[0].preset.sandbox)),
+    sandboxService: serviceOf.get(profileNameOf(entries[0].preset.sandbox) ?? ""),
     ...common
   };
   if (presets.some((preset) => preset.description !== undefined)) {
@@ -415,7 +435,7 @@ function carrySingle(name, preset, serviceOf, poolNames) {
     carried.models = [modelId(pool, split.name)];
   }
   if (preset.sandbox !== undefined) {
-    const service = serviceOf.get(String(preset.sandbox));
+    const service = serviceOf.get(profileNameOf(preset.sandbox) ?? "");
     if (!service) {
       throw new Error(`Single preset "${name}": sandbox profile "${preset.sandbox}" is not defined.`);
     }
