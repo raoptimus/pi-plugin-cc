@@ -208,6 +208,17 @@ test("Т-7: model2 снят и назван", () => {
   assert.match(dropped[0], /python-developer-deepseek\.model2/);
 });
 
+test("Т-8: --out пишет копию с правами 0600, как вход с секретом", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "migrate-mode-"));
+  const src = path.join(dir, "config.json");
+  const dst = path.join(dir, "new.json");
+  fs.writeFileSync(src, JSON.stringify(liveFleet()), { mode: 0o600 });
+
+  execFileSync(process.execPath, [SCRIPT, src, "--out", dst], { encoding: "utf8" });
+  const mode = fs.statSync(dst).mode & 0o777;
+  assert.equal(mode, 0o600, `got ${mode.toString(8)}; the copy carries tokenCommand secrets`);
+});
+
 test("Т-8: скрипт не пишет в исходник; пишет только в указанный другой путь", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "migrate-"));
   const src = path.join(dir, "config.json");

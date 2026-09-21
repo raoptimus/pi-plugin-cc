@@ -1083,7 +1083,10 @@ export async function main(argv) {
       process.stderr.write("Refusing to write over the input.\n");
       return 2;
     }
-    fs.writeFileSync(outPath, newText);
+    // The config carries `tokenCommand` with a secret: the copy never gets
+    // wider than the owner-only file it came from, even when the input itself
+    // was sloppier than 0600.
+    fs.writeFileSync(outPath, newText, { encoding: "utf8", mode: 0o600 });
     process.stdout.write(`New configuration written to ${outPath}\n\n`);
   }
   if (migrated.dropped.length) {
