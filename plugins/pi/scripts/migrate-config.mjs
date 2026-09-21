@@ -990,19 +990,40 @@ function refusesOutputOverInput(inputPath, outPath) {
 }
 
 export async function main(argv) {
-  const noDiff = argv.includes("--no-diff");
-  const outIndex = argv.indexOf("--out");
+  // Жёсткий разбор: неизвестный флаг или лишний позиционный аргумент — ошибка,
+  // а не тихий пропуск (`--dffi` или `a.json b.json` с exit 0 создавали у
+  // владельца ложную уверенность, что миграция сделана).
+  const KNOWN_FLAGS = new Set(["--out", "--no-diff"]);
+  let noDiff = false;
   let outPath = null;
-  if (outIndex !== -1) {
-    outPath = argv[outIndex + 1];
-    if (!outPath || outPath.startsWith("--")) {
-      process.stderr.write("--out needs a file path.\n");
+  const positional = [];
+  for (let index = 0; index < argv.length; index++) {
+    const token = argv[index];
+    if (KNOWN_FLAGS.has(token)) {
+      if (token === "--no-diff") {
+        noDiff = true;
+        continue;
+      }
+      const value = argv[index + 1];
+      if (value === undefined || value.startsWith("--")) {
+        process.stderr.write("--out needs a file path.\n");
+        return 2;
+      }
+      outPath = value;
+      index++;
+      continue;
+    }
+    if (token.startsWith("--")) {
+      process.stderr.write(`Unknown flag "${token}". Known flags: --out <file>, --no-diff.\n`);
       return 2;
     }
+    positional.push(token);
   }
-  const inputPath = argv
-    .filter((token, index) => outIndex === -1 || (index !== outIndex && index !== outIndex + 1))
-    .find((token) => !token.startsWith("--"));
+  if (positional.length > 1) {
+    process.stderr.write(`Unexpected extra argument "${positional[1]}". The script takes exactly one input file.\n`);
+    return 2;
+  }
+  const inputPath = positional[0];
   if (!inputPath) {
     process.stderr.write(usage());
     return 2;
