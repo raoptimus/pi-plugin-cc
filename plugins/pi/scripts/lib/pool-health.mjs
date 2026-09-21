@@ -84,16 +84,19 @@ export function classifyPoolFailure(text) {
  * 30 minutes"); when it does, waiting the named span beats waiting a day.
  */
 function parseNamedDuration(text) {
-  const match = /(?:retry|try)\s+after\s+(\d+)\s*(s|sec|secs|seconds|m|min|mins|minutes|h|hour|hours)\b/i.exec(
-    String(text ?? "")
-  );
-  if (!match) {
-    return null;
+  const value = String(text ?? "");
+  const match = /(?:retry|try)\s+after\s+(\d+)\s*(s|sec|secs|seconds|m|min|mins|minutes|h|hour|hours)\b/i.exec(value);
+  if (match) {
+    const amount = Number(match[1]);
+    const unit = match[2].toLowerCase();
+    const seconds = unit.startsWith("s") ? amount : unit.startsWith("m") ? amount * 60 : amount * 3600;
+    return seconds * 1000;
   }
-  const amount = Number(match[1]);
-  const unit = match[2].toLowerCase();
-  const seconds = unit.startsWith("s") ? amount : unit.startsWith("m") ? amount * 60 : amount * 3600;
-  return seconds * 1000;
+  // Header form: `Retry-After: 3600` carries bare seconds and no unit; the
+  // provider named its window either way, so the day default would be idle
+  // capacity the provider explicitly offered back sooner.
+  const headerMatch = /retry[-\s]?after\s*[:=]\s*(\d+)\b/i.exec(value);
+  return headerMatch ? Number(headerMatch[1]) * 1000 : null;
 }
 
 /**

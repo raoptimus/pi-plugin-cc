@@ -72,6 +72,9 @@ test("hold lengths follow the class: named quota window, otherwise the defaults"
     poolHoldMs({ failureClass: "quota", reason: "retry after 45 minutes", failures: 1, ...COOLDOWNS }),
     45 * 60_000
   );
+  // The header form names its window in bare seconds — still the provider's word.
+  assert.equal(poolHoldMs({ failureClass: "quota", reason: "Retry-After: 3600", failures: 1, ...COOLDOWNS }), 3_600_000);
+  assert.equal(poolHoldMs({ failureClass: "quota", reason: "retry-after: 90", failures: 1, ...COOLDOWNS }), 90_000);
   assert.equal(poolHoldMs({ failureClass: "quota", reason: "429 quota exceeded", failures: 1, ...COOLDOWNS }), 86_400_000);
   // Network: 30s → 60s → 120s → 300s on consecutive failures, capped.
   assert.equal(poolHoldMs({ failureClass: "network", reason: "ECONNREFUSED", failures: 1, ...COOLDOWNS }), 30_000);
