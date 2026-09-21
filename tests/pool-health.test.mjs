@@ -97,6 +97,45 @@ test("a recorded failure puts the pool out of the choice until its deadline, the
   });
 });
 
+test("simultaneous failures on different pools all survive the write", async () => {
+  const { execFile: execFileCb } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const execFile = promisify(execFileCb);
+  const moduleUrl = new URL("../plugins/pi/scripts/lib/pool-health.mjs", import.meta.url).pathname;
+
+  await withIsolatedState(async () => {
+    // One process per pool, 40 records each: without the lock each writer
+    // writes back only the pool it read, and the slower one drops the rest —
+    // the reviewer's reproduction of one outage fanning out to the fleet.
+    const pools = ["alpha", "beta", "gamma"];
+    const ROUNDS = 40;
+    await Promise.all(
+      pools.map((pool) =>
+        execFile(
+          process.execPath,
+          [
+            "-e",
+            `
+import { recordPoolFailure } from ${JSON.stringify(moduleUrl)};
+for (let i = 0; i < ${ROUNDS}; i++) {
+  recordPoolFailure(${JSON.stringify(pool)}, "network", "ECONNREFUSED", ${JSON.stringify(COOLDOWNS)});
+}
+`
+          ],
+          { env: { ...process.env, CLAUDE_PLUGIN_DATA: process.env.CLAUDE_PLUGIN_DATA } }
+        )
+      )
+    );
+
+    // Every death is still there: the file parses and carries each pool with
+    // its full failure count — none of the writes was silently dropped.
+    const state = JSON.parse(fs.readFileSync(poolHealthPath(), "utf8"));
+    for (const pool of pools) {
+      assert.equal(state.pools[pool]?.failures, ROUNDS, `pool ${pool} kept every record`);
+    }
+  });
+});
+
 test("consecutive failures accumulate the network hold; a cleared record starts over", async () => {
   await await withIsolatedState(async () => {
     const now = Date.now();

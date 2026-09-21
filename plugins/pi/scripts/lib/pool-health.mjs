@@ -30,7 +30,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { nowIso, pluginStateRoot } from "./state.mjs";
+import { nowIso, pluginStateRoot, withStateLock, writeFileAtomic } from "./state.mjs";
 
 const STATE_FILE_NAME = "pool-health.json";
 
@@ -132,7 +132,19 @@ function readState() {
 function writeState(state) {
   const filePath = poolHealthPath();
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, `${JSON.stringify(state, null, 2)}\n`);
+  // rename, not truncate-in-place: a concurrent reader must see the old record
+  // or the new one, never half of each (a torn file fail-opens to "nothing is
+  // dead", which is exactly the wrong default here).
+  writeFileAtomic(filePath, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+/** The pool-health file is machine-wide, so its lock lives next to it. */
+function withHealthLock(fn) {
+  // The lock is a plain mkdir: the parent directory must exist first, or every
+  // early acquisition fails with ENOENT, burns the wait deadline and degrades
+  // into an unlocked write — the very race this lock exists to close.
+  fs.mkdirSync(path.dirname(poolHealthPath()), { recursive: true });
+  return withStateLock(`${poolHealthPath()}.lock`, fn);
 }
 
 function isPlainObject(value) {
@@ -145,40 +157,49 @@ function isPlainObject(value) {
  * the next network blip starts from the short hold again.
  */
 export function recordPoolFailure(pool, failureClass, reason, { now = Date.now(), balanceMs, quotaMs, networkMs } = {}) {
-  const state = readState();
-  const previous = isPlainObject(state.pools[pool]) ? state.pools[pool] : null;
-  const failures = previous ? (previous.failures ?? 1) + 1 : 1;
-  const holdMs = poolHoldMs({ failureClass, reason, failures, balanceMs, quotaMs, networkMs });
-  state.pools[pool] = {
-    class: failureClass,
-    reason: String(reason ?? "").slice(0, MAX_REASON_CHARS),
-    failures,
-    failedAt: nowIso(),
-    // Deadline as epoch ms plus the ISO form: the choice compares numerically,
-    // the `pools` command prints a date a person can read.
-    retryAtMs: now + holdMs,
-    retryAt: new Date(now + holdMs).toISOString()
-  };
-  writeState(state);
-  return state.pools[pool];
+  // Read-modify-write under the lock: simultaneous failures on different pools
+  // land within the same second (one provider outage fans out to every fleet
+  // run), and two unlocked writers would each write back the pool it saw — the
+  // slower one silently dropping the other's death.
+  return withHealthLock(() => {
+    const state = readState();
+    const previous = isPlainObject(state.pools[pool]) ? state.pools[pool] : null;
+    const failures = previous ? (previous.failures ?? 1) + 1 : 1;
+    const holdMs = poolHoldMs({ failureClass, reason, failures, balanceMs, quotaMs, networkMs });
+    state.pools[pool] = {
+      class: failureClass,
+      reason: String(reason ?? "").slice(0, MAX_REASON_CHARS),
+      failures,
+      failedAt: nowIso(),
+      // Deadline as epoch ms plus the ISO form: the choice compares numerically,
+      // the `pools` command prints a date a person can read.
+      retryAtMs: now + holdMs,
+      retryAt: new Date(now + holdMs).toISOString()
+    };
+    writeState(state);
+    return state.pools[pool];
+  });
 }
 
 /** A successful run proves the pool works: the record goes, hold and all. */
 export function clearPool(pool) {
-  const state = readState();
-  if (!isPlainObject(state.pools[pool])) {
-    return false;
-  }
-  delete state.pools[pool];
-  writeState(state);
-  return true;
+  return withHealthLock(() => {
+    const state = readState();
+    if (!isPlainObject(state.pools[pool])) {
+      return false;
+    }
+    delete state.pools[pool];
+    writeState(state);
+    return true;
+  });
 }
 
 export function clearAllPools() {
-  const state = readState();
-  const count = Object.keys(state.pools).length;
-  writeState({ pools: {} });
-  return count;
+  return withHealthLock(() => {
+    const count = Object.keys(readState().pools).length;
+    writeState({ pools: {} });
+    return count;
+  });
 }
 
 /** Records whose probe deadline has not passed yet — the pools to skip. */

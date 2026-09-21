@@ -258,7 +258,7 @@ function inboxPathFor(workspaceRoot, jobId) {
  * `writeFileSync` truncates first, so a reader that arrives mid-write sees a
  * broken file; rename is atomic, so it sees either the old content or the new.
  */
-function writeFileAtomic(filePath, contents) {
+export function writeFileAtomic(filePath, contents) {
   sweepStaleTemporaries(filePath);
   const temporary = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   try {
@@ -284,8 +284,7 @@ function sleepSync(ms) {
  * writing. Without the lock, two processes read-modify-write the same file and
  * the slower one silently drops whatever the faster one added.
  */
-function withStateLock(workspaceRoot, fn) {
-  const lockPath = `${resolveStateFile(workspaceRoot)}.lock`;
+export function withStateLock(lockPath, fn) {
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
   let held = false;
 
@@ -361,7 +360,7 @@ function sweepStaleTemporaries(filePath) {
 
 export function updateState(workspaceRoot, mutate) {
   ensureStateDir(workspaceRoot);
-  return withStateLock(workspaceRoot, (held) => {
+  return withStateLock(`${resolveStateFile(workspaceRoot)}.lock`, (held) => {
     const state = loadState(workspaceRoot);
     mutate(state);
     // Without the lock another writer may be mid-update, and this view of the
