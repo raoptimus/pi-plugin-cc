@@ -549,20 +549,26 @@ test("images are collected from the profiles that name them", async () => {
   assert.equal(byImage["pi-sandbox-rust:latest"].dockerfile, "~/.claude/pi/sandbox/rust.Dockerfile");
 });
 
-test("an inheriting profile is filed under the image it actually runs on", async () => {
+test("an inheriting service is filed under the image it actually runs on", async () => {
   const { listSandboxImages, DEFAULT_SANDBOX_IMAGE: base } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
-  // The roles form states image and dockerfile once, on the service every role
-  // extends. Read off the raw entry, the children carry neither and land on the
-  // base image — then `sandbox build agent` rebuilds the wrong tag from the
-  // wrong Dockerfile while the roles keep running on the right one.
-  const images = listSandboxImages({
-    sandboxProfiles: {
-      "agent-base": { image: "pi-sandbox-agent:latest", dockerfile: "agent" },
-      agent: { profile: "agent-base", env: ["PI_DIND=1"] },
-      "agent-lite": { profile: "agent-base" },
-      broken: { profile: "no-such-parent" }
-    }
-  });
+  const { normalizeConfigLayer } = await import("../plugins/pi/scripts/lib/config.mjs");
+  // Entered through the form the owner actually writes — `sandboxServices` with
+  // `extend` — and normalized the way a load does, so the test covers the whole
+  // path instead of the internal spelling. The roles form states image and
+  // dockerfile once, on the service every role extends; read off the raw entry,
+  // the children carry neither and land on the base image — then `sandbox build
+  // agent` rebuilds the wrong tag from the wrong Dockerfile while the roles keep
+  // running on the right one.
+  const images = listSandboxImages(
+    normalizeConfigLayer({
+      sandboxServices: [
+        { id: "agent-base", image: "pi-sandbox-agent:latest", dockerfile: "agent" },
+        { id: "agent", extend: "agent-base", env: ["PI_DIND=1"] },
+        { id: "agent-lite", extend: "agent-base" },
+        { id: "broken", extend: "no-such-service" }
+      ]
+    })
+  );
 
   const byImage = Object.fromEntries(images.map((entry) => [entry.image, entry]));
   assert.deepEqual(
