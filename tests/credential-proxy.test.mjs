@@ -944,3 +944,60 @@ test("both engines deliver sandbox.samplingParams to the credential proxy", asyn
     }
   }
 });
+
+// Т-10, шов «реестр → прокси»: не прокси самому себе кормит параметры, а
+// выбранный на выдаче вариант — от buildVariants через applyPickedVariant до
+// тела запроса. Промежуточный шаг, потерявший samplingParams, оставит зелёными
+// и тесты прокси, и тесты выбора.
+test("the chosen variant's samplingParams reach the request body through the pick", async (t) => {
+  const upstream = await startUpstream();
+  const home = homeWithSampling(upstream.port, { max_tokens: 555 });
+  fs.writeFileSync(
+    path.join(home, ".pi", "agent", "auth.json"),
+    JSON.stringify({ "test-provider": { type: "api", key: "REAL-SECRET-KEY" } })
+  );
+  const realHome = process.env.HOME;
+  process.env.HOME = home;
+  t.after(() => {
+    process.env.HOME = realHome;
+    upstream.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  const { normalizeConfigLayer } = await import("../plugins/pi/scripts/lib/config.mjs");
+  const { buildVariants, applyPickedVariant } = await import("../plugins/pi/scripts/pi-companion.mjs");
+  const { openCredentialProxy } = await import("../plugins/pi/scripts/lib/rpc.mjs");
+
+  const config = normalizeConfigLayer({
+    concurrencyPools: [
+      {
+        pool: "vllm",
+        limit: 1,
+        models: [{ id: "vllm-dev", provider: "test-provider", name: "real-model-v2", samplingParams: { max_tokens: 424242 } }]
+      }
+    ],
+    presets: [{ id: "role", models: ["vllm-dev"] }]
+  });
+  const preset = normalizeConfigLayer({ presets: [{ id: "role", models: ["vllm-dev"] }] }).presets.role;
+  const { variants } = buildVariants(preset, config);
+  assert.equal(variants[0].samplingParams.max_tokens, 424242, "the registry carries the record's params");
+
+  const settings = { sandbox: { ...variants[0].sandbox, mode: "docker", auth: true } };
+  applyPickedVariant(settings, variants[0]);
+  assert.deepEqual(settings.sandbox.samplingParams, { max_tokens: 424242 }, "the pick moved them onto the sandbox");
+
+  const proxy = await openCredentialProxy(settings.sandbox, null, "test-provider/real-model-v2");
+  assert.ok(proxy, "the proxy opens");
+  const local = proxy.url.replace("host.docker.internal", "127.0.0.1");
+  try {
+    await fetch(`${local}/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${proxy.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "agent-model", messages: [{ role: "user", content: "hi" }] })
+    });
+    const sent = JSON.parse(upstream.seen[upstream.seen.length - 1].body);
+    assert.equal(sent.max_tokens, 424242, "the chosen model's ceiling is on the wire, not the registry's 555");
+  } finally {
+    await proxy.close();
+  }
+});

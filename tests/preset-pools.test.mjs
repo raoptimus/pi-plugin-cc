@@ -604,6 +604,264 @@ test("the slot-time pick keeps the developed sandbox and moves only model-choice
   assert.deepEqual(settings.tags, ["role-tag", "model-tag"]);
 });
 
+// Т-8, финальная клауза: выбор варианта обязан положить в settings provider,
+// model, thinking, tags и samplingParams ВЫБРАННОЙ модели — иначе прогон уезжает
+// с thinking/потолком первой же записи, которую пропустили.
+test("the slot pick fills settings with the CHOSEN model's provider, model, thinking, tags and samplingParams", async () => {
+  const { buildVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
+  const { awaitSandboxSlot, awaitVariantSlot } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
+  const { resolveRunSettings } = await import("../plugins/pi/scripts/lib/config.mjs");
+  const { applyPickedVariant } = await import("../plugins/pi/scripts/pi-companion.mjs");
+
+  const config = normalizeConfigLayer(ownerFormConfig({ limit: 1 }));
+  config.presets.role.models = [`fast-${UNIQUE}`, `other-${UNIQUE}`];
+  config.presets.role.thinking = "high";
+  config.presets.role.tags = ["role-tag"];
+  const alpha = config.concurrencyPools[`alpha-${UNIQUE}`].models;
+  alpha[`fast-${UNIQUE}`] = {
+    ...alpha[`fast-${UNIQUE}`],
+    thinking: "off",
+    tags: [`fast-tag-${UNIQUE}`],
+    samplingParams: { temperature: 1, max_tokens: 111 }
+  };
+  config.concurrencyPools[`beta-${UNIQUE}`].models[`other-${UNIQUE}`] = {
+    ...config.concurrencyPools[`beta-${UNIQUE}`].models[`other-${UNIQUE}`],
+    thinking: "low",
+    tags: [`smart-tag-${UNIQUE}`],
+    samplingParams: { temperature: 0.5, max_tokens: 222 }
+  };
+
+  const settings = resolveRunSettings(config, "delegate", { preset: "role" });
+  const { variants } = buildVariants(config.presets.role, config);
+  settings.sandbox = variants[0].sandbox;
+
+  // The first candidate's pool is busy: the pick must land on the second, and
+  // every model-choice field must be the SECOND's — not the first's, not the
+  // preset's.
+  const held = await awaitSandboxSlot(variants[0].sandbox, { timeoutMs: 1000, pollMs: 10 });
+  try {
+    const picked = await awaitVariantSlot(variants, { poolWaitMs: 0, timeoutMs: 5000 });
+    assert.equal(picked.id, `other-${UNIQUE}`, "the busy first candidate was skipped");
+    applyPickedVariant(settings, picked);
+    picked.release();
+  } finally {
+    held.release();
+  }
+
+  assert.equal(settings.provider, "prov2");
+  assert.equal(settings.model, "prov2/other-model");
+  assert.equal(settings.thinking, "low", "the chosen model's thinking, not the first's (off) or the preset's (high)");
+  assert.ok(settings.tags.includes(`smart-tag-${UNIQUE}`) && settings.tags.includes("role-tag"), JSON.stringify(settings.tags));
+  assert.ok(!settings.tags.includes(`fast-tag-${UNIQUE}`), "the skipped model's tags did not leak in");
+  assert.deepEqual(settings.sandbox.samplingParams, { temperature: 0.5, max_tokens: 222 }, "the chosen model's sampling params, not the first's");
+});
+
+// Т-9: теги записи модели доезжают до settings даже без тегов пресета —
+// ассерт «список непустой» этот случай не ловит, нужен точный состав.
+test("a model's own tags land in settings even when the preset names none", async () => {
+  const { buildVariants } = await import("../plugins/pi/scripts/pi-companion.mjs");
+  const { awaitVariantSlot } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
+  const { resolveRunSettings } = await import("../plugins/pi/scripts/lib/config.mjs");
+  const { applyPickedVariant } = await import("../plugins/pi/scripts/pi-companion.mjs");
+
+  const config = normalizeConfigLayer(ownerFormConfig());
+  config.concurrencyPools[`beta-${UNIQUE}`].models[`other-${UNIQUE}`].tags = [`model-only-${UNIQUE}`];
+  config.presets.role.models = [`other-${UNIQUE}`];
+  assert.equal(config.presets.role.tags, undefined, "the preset carries no tags of its own");
+
+  const settings = resolveRunSettings(config, "delegate", { preset: "role" });
+  const { variants } = buildVariants(config.presets.role, config);
+  settings.sandbox = variants[0].sandbox;
+  const picked = await awaitVariantSlot(variants, { poolWaitMs: 0, timeoutMs: 5000 });
+  applyPickedVariant(settings, picked);
+  picked.release();
+
+  assert.deepEqual(settings.tags, [`model-only-${UNIQUE}`], "the model record's tags are the whole answer");
+  assert.equal(
+    variantById(buildVariants(config.presets.role, config).variants, `other-${UNIQUE}`).tags.length,
+    1,
+    "the variant itself carries the model's tags"
+  );
+});
+
+// Т-1: нормализация массивов обязана стоять ДО слияния слоёв в реальном
+// конвейере loadConfig, а не только в тесте, который зовёт её руками.
+test("loadConfig normalizes owner-form arrays before merging: the user's pools survive a project layer", async (t) => {
+  const { loadConfig } = await import("../plugins/pi/scripts/lib/config.mjs");
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-pools-home-"));
+  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-pools-ws-"));
+  fs.mkdirSync(path.join(home, ".claude", "pi"), { recursive: true });
+  fs.mkdirSync(path.join(workspaceRoot, ".claude", "pi"), { recursive: true });
+  const realHome = process.env.HOME;
+  process.env.HOME = home;
+  t.after(() => {
+    process.env.HOME = realHome;
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Raw user layer, owner form, TWO pools. Raw project layer, ONE pool.
+  fs.writeFileSync(
+    path.join(home, ".claude", "pi", "config.json"),
+    JSON.stringify({
+      concurrencyPools: [
+        { pool: `user-a-${UNIQUE}`, limit: 3, models: [{ id: `ma-${UNIQUE}`, provider: "p", name: "m" }] },
+        { pool: `user-b-${UNIQUE}`, limit: 4, models: [{ id: `mb-${UNIQUE}`, provider: "p", name: "m" }] }
+      ],
+      presets: [{ id: "role", models: [`ma-${UNIQUE}`], sandboxService: "svc" }],
+      sandboxServices: [{ id: "svc", image: "img" }]
+    })
+  );
+  fs.writeFileSync(
+    path.join(workspaceRoot, ".claude", "pi", "config.json"),
+    JSON.stringify({ concurrencyPools: [{ pool: `project-c-${UNIQUE}`, limit: 5 }] })
+  );
+
+  const { config } = loadConfig(workspaceRoot);
+  assert.deepEqual(
+    Object.keys(config.concurrencyPools).filter((name) => name.includes(UNIQUE)),
+    [`user-a-${UNIQUE}`, `user-b-${UNIQUE}`, `project-c-${UNIQUE}`],
+    "the project's single pool did not wipe the user's two"
+  );
+  assert.equal(config.presets.role.sandbox, "svc", "the user's preset survived whole");
+});
+
+// Т-2: сервис и профиль с одним именем живут в одном пространстве — сервис
+// старше; extend сервиса ссылается на запись старого блока профилей.
+test("a sandboxServices entry wins a name collision with sandboxProfiles and extends into the old block", async () => {
+  const { normalizeConfigLayer } = await import("../plugins/pi/scripts/lib/config.mjs");
+  const { normalizeSandbox } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
+
+  const config = normalizeConfigLayer({
+    sandboxProfiles: {
+      shared: { image: "from-profiles", env: ["ONLY_PROFILES=1"] },
+      legacy: { image: "legacy-img", mounts: ["/srv/legacy:/legacy:ro"] }
+    },
+    sandboxServices: [
+      { id: "shared", image: "from-services", args: ["--cpus", "2"] },
+      { id: "child", extend: "legacy", env: ["CHILD=1"] }
+    ]
+  });
+
+  assert.equal(config.sandboxProfiles.shared.image, "from-services", "the service wins the collision");
+  assert.equal(config.sandboxProfiles.shared.env, undefined, "the profile's env did not survive under the service's name");
+
+  const child = normalizeSandbox("child", config.sandboxProfiles);
+  assert.equal(child.image, "legacy-img", "extend reached a record of the old profiles block");
+  assert.ok(child.mounts.includes("/srv/legacy:/legacy:ro"));
+  assert.ok(child.env.includes("CHILD=1"));
+});
+
+// Приёмка «пример владельца читается И ПЕЧАТАЕТСЯ»: печать поверх дословного
+// примера — строка с тремя моделями в порядке выбора и сервисом песочницы.
+test("the owner's example prints: models in choice order and the sandbox service on the line", async () => {
+  const { presetPlansFor } = await import("../plugins/pi/scripts/pi-companion.mjs");
+  const { presetLines } = await import("../plugins/pi/scripts/lib/render.mjs");
+
+  const config = normalizeConfigLayer(ownerExampleLiteral());
+  const plans = presetPlansFor(config);
+  const lines = presetLines(config.presets, {}, {}, plans);
+  const line = lines.find((entry) => entry.includes("go-developer"));
+  assert.ok(line, `the preset has a line: ${JSON.stringify(lines)}`);
+
+  const modelsPart = line.match(/models (.*?)(?:, sandbox |$)/)?.[1] ?? "";
+  const printed = [...modelsPart.matchAll(/`([^`]+)`/g)].map((match) => match[1]);
+  assert.deepEqual(
+    printed,
+    ["zai-glm-5.3-flash", "deepseek-deepseek-v4-flash", "vllm-dev-Qwen3.8-27B"],
+    `the three models print in choice order, got: ${JSON.stringify(printed)}`
+  );
+  assert.match(line, /sandbox `sandbox-agent`/);
+  assert.ok(line.includes("(zai, ") && line.includes("(deepseek, ") && line.includes("(vllm, "), `each model prints with its pool: ${line}`);
+});
+
+// Т-14 на НОВОМ пути: расчёт дыр оснастки читает пресет новой формы и сервис
+// из sandboxServices, а не только старый профиль.
+test("equipment gaps are computed for a preset of the new form backed by a sandboxServices entry", async () => {
+  const { presetPlansFor } = await import("../plugins/pi/scripts/pi-companion.mjs");
+  const { presetLines } = await import("../plugins/pi/scripts/lib/render.mjs");
+  const { allPresetCapabilities } = await import("../plugins/pi/scripts/lib/capabilities.mjs");
+
+  const config = normalizeConfigLayer({
+    concurrencyPools: [
+      { pool: `p-${UNIQUE}`, limit: 1, models: [{ id: `m-${UNIQUE}`, provider: "prov", name: "mdl" }] }
+    ],
+    sandboxServices: [
+      {
+        id: "gapped",
+        image: "img",
+        skills: ["/pi-skills/git-commit"],
+        mounts: ["/srv/elsewhere:/elsewhere:ro"]
+      }
+    ],
+    presets: [{ id: "role", models: [`m-${UNIQUE}`], sandboxService: "gapped" }]
+  });
+
+  const caps = allPresetCapabilities(config);
+  assert.deepEqual(caps.role.mountGaps, ["/pi-skills/git-commit"], "the gap is computed through the new path");
+  const [line] = presetLines(config.presets, caps, {}, presetPlansFor(config));
+  assert.match(line, /NOT MOUNTED: \/pi-skills\/git-commit/, `the line names the gap: ${line}`);
+  assert.match(line, new RegExp(`models \`m-${UNIQUE}\` \\(p-${UNIQUE}, prov\\)`));
+});
+
+// Т-1: дубль id ПРЕСЕТА в массиве — отказ с именем (для пулов, сервисов и
+// моделей отказ уже проверен).
+test("a duplicate preset id in the array is refused with the name", () => {
+  assert.throws(
+    () => normalizeConfigLayer({ presets: [{ id: "dup" }, { id: "dup", model: "m" }] }),
+    /Duplicate id "dup".*presets/,
+    "the refusal names the duplicated preset id and the block"
+  );
+});
+
+// Т-13: env и image сервиса из проектного слоя отбрасываются с предупреждением —
+// env это вектор утечки секретов хоста в контейнер, image подменяет сам образ.
+test("a project layer's sandboxServices lose env and image, with a warning naming each", async () => {
+  const { sanitizeProjectLayer, BUILT_IN_CONFIG, mergeConfigLayer } = await import(
+    "../plugins/pi/scripts/lib/config.mjs"
+  );
+
+  const warnings = [];
+  const project = sanitizeProjectLayer(
+    normalizeConfigLayer({
+      sandboxServices: [{ id: "sneaky", image: "evil:latest", env: ["AWS_SECRET_ACCESS_KEY=x"], extensions: ["/w/ext.ts"] }]
+    }),
+    warnings
+  );
+  const merged = mergeConfigLayer(BUILT_IN_CONFIG, project);
+
+  assert.equal(merged.sandboxProfiles.sneaky.env, undefined, "host env does not pass through the project layer");
+  assert.equal(merged.sandboxProfiles.sneaky.image, undefined, "the project cannot swap the image");
+  assert.equal(merged.sandboxProfiles.sneaky.extensions.length, 1, "an ordinary list field survives");
+  assert.ok(warnings.some((line) => line.includes("sneaky.sandbox.env ignored")), JSON.stringify(warnings));
+  assert.ok(warnings.some((line) => line.includes("sneaky.sandbox.image ignored")), JSON.stringify(warnings));
+});
+
+// Т-3: extensions и skills тоже складываются через extend — скиллы и хостовые
+// расширения базы обязаны достаться ребёнку, иначе его контейнер без правил.
+test("extend carries extensions and skills to the child", async () => {
+  const { normalizeConfigLayer } = await import("../plugins/pi/scripts/lib/config.mjs");
+  const { normalizeSandbox } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
+
+  const config = normalizeConfigLayer({
+    sandboxServices: [
+      {
+        id: "base",
+        image: "img",
+        extensions: ["/pi-agent/host-extensions/hooks/index.ts"],
+        skills: ["/pi-skills/vision"]
+      },
+      { id: "child", extend: "base", args: ["--cpus", "2"] }
+    ]
+  });
+
+  const child = normalizeSandbox("child", config.sandboxProfiles);
+  assert.deepEqual(child.extensions, ["/pi-agent/host-extensions/hooks/index.ts"]);
+  assert.deepEqual(child.skills, ["/pi-skills/vision"]);
+  assert.ok(child.args.includes("--cpus"), "the child's own fields stay");
+});
+
 // A pin whose pool holds none of the preset's models used to produce zero
 // variants and fall through to pi's default model — no pool limit, no refusal.
 test("a pool pin that matches nothing is a refusal naming the preset, pool and models", async () => {
