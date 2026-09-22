@@ -926,19 +926,29 @@ function rerunRecipe(settings) {
  * must survive the pick — they belong to the workspace, not to the model.
  */
 export function applyPickedVariant(settings, picked) {
+  settings.model = settings.model ?? picked.model;
+  // A bare `--model` name is a preset model id and runs on the winner's
+  // endpoint — the winner decides which account pays. A literal `provider/name`
+  // names its own provider (as `providerOf` read it before the slot race):
+  // keying the winner's credential on it would send that account a model it
+  // may not serve, and `modelIdFor` would not strip the foreign prefix.
+  // A winner's own `model` is `provider/name` too, so the prefix rule returns
+  // the winner's provider for it — the bare case keeps its current behavior.
+  const literal = typeof settings.model === "string" ? settings.model : "";
+  const separator = literal.indexOf("/");
+  const provider = settings.provider ?? (separator > 0 ? literal.slice(0, separator) : picked.provider);
   settings.sandbox = {
     ...settings.sandbox,
-    // The proxy keys the credential on the provider of the model that won,
-    // not on whichever candidate stood in during preflight.
-    provider: picked.provider,
+    // The proxy keys the credential on the provider the run is addressed
+    // with, not on whichever candidate stood in during preflight.
+    provider,
     samplingParams: picked.samplingParams ?? undefined,
     poolName: picked.sandbox.poolName,
     maxConcurrent: picked.sandbox.maxConcurrent,
     ...(picked.sandbox.heldSlot ? { heldSlot: picked.sandbox.heldSlot } : {})
   };
   settings.sandboxLabel = describeSandbox(settings.sandbox);
-  settings.model = settings.model ?? picked.model;
-  settings.provider = settings.provider ?? picked.provider;
+  settings.provider = provider;
   // The model record's thinking overrides the preset's — that is how
   // `*-local` (thinking off) and `*-zai` (low) collapse into one preset. A
   // command-line flag still outranks both, hence the source check.

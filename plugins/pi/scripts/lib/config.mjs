@@ -202,10 +202,33 @@ function normalizePreset(preset, name) {
  * service winning a name collision — it is the more specific spelling. Pools
  * keep the historical number-of-slots map untouched and gain the array form.
  */
+/**
+ * Timings that steer pool waiting and cooldowns reach the run as milliseconds
+ * through `Number()`. A spelling like `"30s"` normalizes to NaN there: the run
+ * then camps on a busy pool forever, and a `RangeError: Invalid time value`
+ * after the run masks the original failure. Same rule as a pool's "limit": a
+ * non-finite or negative value is refused with the field named, never silently
+ * defaulted.
+ */
+function refuseBadPoolTiming(layer) {
+  for (const field of ["poolWaitMs", "poolCooldownBalanceMs", "poolCooldownQuotaMs", "poolCooldownNetworkMs"]) {
+    if (layer[field] === undefined) {
+      continue;
+    }
+    const ms = Number(layer[field]);
+    if (!Number.isFinite(ms) || ms < 0) {
+      throw new Error(
+        `Config field "${field}" must be a non-negative number of milliseconds, got ${JSON.stringify(layer[field])}.`
+      );
+    }
+  }
+}
+
 export function normalizeConfigLayer(layer) {
   if (!isPlainObject(layer)) {
     return layer;
   }
+  refuseBadPoolTiming(layer);
   const clean = { ...layer };
 
   if (Array.isArray(clean.sandboxServices)) {
@@ -273,13 +296,38 @@ export function refuseRemovedConcurrencyGroup(layer) {
     }
   }
   for (const [name, preset] of Object.entries(layer.presets ?? {})) {
-    if (isPlainObject(preset) && preset.concurrencyGroup !== undefined) {
+    if (!isPlainObject(preset)) {
+      continue;
+    }
+    if (preset.concurrencyGroup !== undefined) {
       refuseRemovedField(
         `Preset "${preset.id ?? name}"`,
         "concurrencyGroup",
         'The pool is determined by the selected model\'s entry in "concurrencyPools" — list model ids under "models" and remove the field.'
       );
     }
+    // The object sandbox (`{profile, env, …}`) carries per-role extras, and the
+    // removed field used to be read from exactly that normalized object — so
+    // refusing only the preset-level spelling would let a config that looks
+    // tuned lose its pool limit silently. `sandboxService` folds into the same
+    // object (its extras become sandbox fields), hence the second check.
+    const objectSandbox =
+      isPlainObject(preset.sandbox) ? preset.sandbox : isPlainObject(preset.sandboxService) ? preset.sandboxService : null;
+    if (objectSandbox && objectSandbox.concurrencyGroup !== undefined) {
+      refuseRemovedField(
+        `Preset "${preset.id ?? name}" (sandbox)`,
+        "concurrencyGroup",
+        'The pool is determined by the selected model\'s entry in "concurrencyPools" — remove the field from the sandbox.'
+      );
+    }
+  }
+  const defaults = layer.defaults;
+  if (isPlainObject(defaults) && isPlainObject(defaults.sandbox) && defaults.sandbox.concurrencyGroup !== undefined) {
+    refuseRemovedField(
+      'defaults (sandbox)',
+      "concurrencyGroup",
+      'The pool is determined by the selected model\'s entry in "concurrencyPools" — remove the field from the sandbox.'
+    );
   }
 }
 
@@ -304,6 +352,14 @@ export function normalizeConcurrencyPool(value, name = "pool") {
   const limit = Number(value.limit);
   if (!Number.isFinite(limit) || limit <= 0) {
     throw new Error(`Concurrency pool "${name}" needs a positive "limit", got ${JSON.stringify(value.limit ?? null)}.`);
+  }
+  if (value.priority !== undefined) {
+    const priority = Number(value.priority);
+    if (!Number.isFinite(priority)) {
+      throw new Error(
+        `Concurrency pool "${name}" needs a finite numeric "priority", got ${JSON.stringify(value.priority)}.`
+      );
+    }
   }
   if (value.aliases !== undefined) {
     refuseRemovedField(

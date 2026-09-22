@@ -744,11 +744,15 @@ test("buildPools: нулевой, отрицательный и нечислов
     raw.concurrencyPools = { zai: limit, deepseek: 2, vllm: 1 };
     assert.throws(() => migrateConfig(raw), /pool "zai" has no usable slot limit/is, `limit ${JSON.stringify(limit)} must be refused`);
   }
+  // Мусорный priority отвергается нормализатором (то же правило, что для
+  // лимита): NaN приоритет раньше давал молчаливое «без приоритета».
   const withPriority = miniFleet();
-  withPriority.concurrencyPools = { zai: { limit: 2, priority: 3 }, deepseek: 2, vllm: { limit: 1, priority: "не число" } };
+  withPriority.concurrencyPools = { zai: { limit: 2, priority: 3 }, deepseek: 2, vllm: 1 };
   const pools = Object.fromEntries(migrateConfig(withPriority).config.concurrencyPools.map((pool) => [pool.pool, pool]));
   assert.equal(pools.zai.priority, 3, "a numeric priority carries over");
-  assert.equal(pools.vllm.priority, 10, "a junk priority falls back to 10");
+  const junkPriority = miniFleet();
+  junkPriority.concurrencyPools = { zai: { limit: 2, priority: "не число" }, deepseek: 2, vllm: 1 };
+  assert.throws(() => migrateConfig(junkPriority), /needs a finite numeric "priority"/is, "junk priority must be refused");
 });
 
 test("buildPools: провайдер вне всех пулов — отказ с именем модели", () => {

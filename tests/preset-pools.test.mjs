@@ -281,6 +281,78 @@ test("old forms keep working: maps, numeric pools; concurrencyGroup is refused, 
     () => refuseRemovedConcurrencyGroup(normalizeConfigLayer({ presets: [{ id: "role", concurrencyGroup: "zai" }] })),
     /Preset "role" uses the removed "concurrencyGroup" field.*"concurrencyPools"/s
   );
+  // Объектная песочница несёт per-role поля, и до дельты поле читалось именно
+  // из нормализованной песочницы: отказ обязан накрывать и эту позицию записи.
+  assert.throws(
+    () =>
+      refuseRemovedConcurrencyGroup(
+        normalizeConfigLayer({ presets: [{ id: "role", sandbox: { profile: "agent", concurrencyGroup: "zai" } }] })
+      ),
+    /Preset "role" \(sandbox\) uses the removed "concurrencyGroup" field/s,
+    "the object preset.sandbox form is refused too"
+  );
+  assert.throws(
+    () => refuseRemovedConcurrencyGroup(normalizeConfigLayer({ defaults: { sandbox: { concurrencyGroup: "zai" } } })),
+    /defaults \(sandbox\) uses the removed "concurrencyGroup" field/s,
+    "the object defaults.sandbox form is refused too"
+  );
+});
+
+// Тайминги пула доходят до прогона через Number(): "30s" там превращается в
+// NaN — прогон вечно ждёт занятый слот, а после него падает с RangeError,
+// маскируя исходную ошибку. Поэтому мусорное значение — отказ конфигурации
+// с именем поля, а не молчаливый дефолт; priority из того же правила.
+test("pool timings and priority are validated at normalization: junk is refused naming the field", async () => {
+  const { normalizeConfigLayer } = await import("../plugins/pi/scripts/lib/config.mjs");
+
+  for (const field of ["poolWaitMs", "poolCooldownBalanceMs", "poolCooldownQuotaMs", "poolCooldownNetworkMs"]) {
+    assert.throws(
+      () => normalizeConfigLayer({ [field]: "30s" }),
+      new RegExp(`Config field "${field}" must be a non-negative number of milliseconds`),
+      `${field} must refuse "30s"`
+    );
+    assert.throws(() => normalizeConfigLayer({ [field]: -1 }), new RegExp(`Config field "${field}"`), `${field} must refuse a negative`);
+  }
+  const valid = normalizeConfigLayer({ poolWaitMs: 5000, poolCooldownNetworkMs: 0 });
+  assert.equal(valid.poolWaitMs, 5000, "a number passes through");
+  assert.equal(valid.poolCooldownNetworkMs, 0, "zero is a legal cooldown");
+
+  assert.throws(
+    () => normalizeConfigLayer({ concurrencyPools: { p: { limit: 2, priority: "high" } } }),
+    /Concurrency pool "p" needs a finite numeric "priority", got "high"/,
+    "a junk priority is refused, not read as NaN"
+  );
+  assert.equal(normalizeConfigLayer({ concurrencyPools: { p: { limit: 2, priority: 0 } } }).concurrencyPools.p.priority, 0);
+});
+
+// Букальный `--model provider/name` (не из пресета) называет СВОЕГО
+// провайдера: если после выбора варианта ключ Credential-прокси ставится по
+// победителю, чужой аккаунт получает модель, которую он, возможно, не
+// обслуживает. Голое имя — наоборот, едет на эндпоинте победителя.
+test("applyPickedVariant: a literal provider/name model keeps its own provider; a bare name takes the winner's", async () => {
+  const { applyPickedVariant } = await import("../plugins/pi/scripts/pi-companion.mjs");
+  const picked = {
+    provider: "zai-coding-cn",
+    model: "zai-coding-cn/glm-5",
+    thinking: null,
+    sandbox: { poolName: "zai", maxConcurrent: 2 }
+  };
+
+  const literal = { model: "openrouter/foo", provider: null, sandbox: {} };
+  applyPickedVariant(literal, picked);
+  assert.equal(literal.model, "openrouter/foo", "the literal model travels as written");
+  assert.equal(literal.provider, "openrouter", "the literal names its own provider");
+  assert.equal(literal.sandbox.provider, "openrouter", "the credential proxy keys on the literal's provider");
+
+  const bare = { model: "some-preset-id", provider: null, sandbox: {} };
+  applyPickedVariant(bare, picked);
+  assert.equal(bare.provider, "zai-coding-cn", "a bare name runs on the winner's endpoint");
+  assert.equal(bare.sandbox.provider, "zai-coding-cn");
+
+  const none = { model: null, provider: null, sandbox: {} };
+  applyPickedVariant(none, picked);
+  assert.equal(none.model, "zai-coding-cn/glm-5");
+  assert.equal(none.provider, "zai-coding-cn", "no model choice at all follows the winner");
 });
 
 test("a project layer with one pool does not wipe the user's pools, and cannot point models at a provider", async () => {
