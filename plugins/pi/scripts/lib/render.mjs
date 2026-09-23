@@ -74,6 +74,14 @@ export function renderSetupReport(report) {
   }
   lines.push(`- System prompts: ${report.prompts.join(", ")}`);
   lines.push(`- Job state directory: \`${report.stateDir}\``);
+  if (report.telemetry) {
+    const t = report.telemetry;
+    lines.push(
+      t.enabled
+        ? `- Telemetry: **enabled** → \`${t.endpoint}\` · headers: ${t.headers}`
+        : `- Telemetry: off (${t.reason})`
+    );
+  }
 
   if (!modelCount) {
     lines.push("");

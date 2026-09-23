@@ -177,5 +177,10 @@ Read from the companion process on the host — they are not passed into the con
 - **`PI_PLUGIN_BINARY`** — what to run pi with (default: `pi` from `PATH`).
 - **`PI_PLUGIN_DB`** — the run journal file instead of `$XDG_DATA_HOME/pi-plugin/jobs.db` (without `XDG_DATA_HOME`: `~/.local/share/pi-plugin/jobs.db`).
 - **`PI_PROXY_BIND`**, **`PI_PROXY_SETTLE_MS`** — bind address and settle delay of the host-side proxies, see [git-proxy.md](git-proxy.md).
+- **`PI_OTEL_ENABLE`** — turns on OTLP export of run metrics from the journal (see [metrics.md](metrics.md)). Truthy values are `1`/`true`; anything else keeps the exporter a full no-op: no network calls, no journal reads.
+- **`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`** — full collector URL, used as-is. Without it, `OTEL_EXPORTER_OTLP_ENDPOINT` + `/v1/metrics` is used — but only when the protocol is http-family.
+- **`OTEL_EXPORTER_OTLP_METRICS_PROTOCOL`** / **`OTEL_EXPORTER_OTLP_PROTOCOL`** — only `http/json`, `http/protobuf` or empty are supported. The default environment of this machine sets `grpc`; until a metrics-endpoint is given, the exporter stays off (visible in `pia setup`).
+- **`OTEL_EXPORTER_OTLP_METRICS_HEADERS`** / **`OTEL_EXPORTER_OTLP_HEADERS`** — `k=v,k=v` request headers, typically the collector's Bearer. Secret: never logged, never in `setup --json` output (setup shows only whether headers exist).
+- **`OTEL_SERVICE_NAME`**, **`OTEL_RESOURCE_ATTRIBUTES`** — resource identity; default service name `pi-coding-agent` matches the pi telemetry extension, and the exporter adds `pi.runner=companion`.
 
 When something does not work, start with `setup`: it shows whether the pi binary was found, whether any models are reachable, which configs were picked up and where job state lives.

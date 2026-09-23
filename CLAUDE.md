@@ -73,6 +73,10 @@ re-resolve `--session last`, which would now match its own pending record.
   per-request rows (envelope only — never messages, prompts or response text).
 - **Fleet events** (`lib/fleet-events.mjs`) — one machine-wide `fleet-events.jsonl` deliberately
   outside the per-workspace buckets, so a supervisor hears about every finished run.
+- **OTLP export** (`lib/otel-export.mjs`) — host-side push of cumulative `pi.token.usage` /
+  `pi.cost.usage` from the journal to a collector after every terminal run, fail-safe and
+  dependency-free; both engines suppress `PI_OTEL_ENABLE` in the child pi's environment so a
+  non-sandboxed run is never counted twice (`withoutOtel` in `pi.mjs` and `rpc.mjs`).
 
 ### Control channel
 

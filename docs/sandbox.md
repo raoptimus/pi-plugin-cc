@@ -21,7 +21,7 @@ tokens never enter the container. The working commands are in the skill (`skills
 | Credentials | never enter the container: a run-scoped proxy on the host holds the real key and the agent gets a token that dies with the run |
 | Identity | your uid/gid, so files written through the mount are not owned by root |
 | Network | on by default, because the model call needs it |
-| Environment | `PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1`, `PI_TELEMETRY=0` — a sandbox default rather than a profile field, so no profile needs to repeat it. The container has no business fetching updates or sending telemetry; its only legitimate outbound connection is the model |
+| Environment | `PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1`, `PI_TELEMETRY=0` — a sandbox default rather than a profile field, so no profile needs to repeat it. The container has no business fetching updates or sending telemetry; its only legitimate outbound connection is the model. `OTEL_*` and the telemetry extension are kept out **deliberately**: inside the container the model name is masked (`agent-model`), so any telemetry it sent would carry a false label — metrics are exported on the host from the journal instead (see [metrics.md](metrics.md)) |
 
 The rest of your home directory, your SSH keys and everything outside the workspace are simply not there. Sessions live in the volume, so `--session last` keeps working across sandboxed runs — but a session started on the host cannot be continued in the sandbox, and vice versa. Sessions are also split per workspace through `PI_CODING_AGENT_SESSION_DIR`: pi buckets them by working directory, and containers used to share one flat `/workspace`, so one bucket held the transcripts of every repository this machine had ever touched.
 

@@ -37,6 +37,7 @@ import {
   summarizeTreeChanges
 } from "./lib/git.mjs";
 import { resolveGitProxyHosts } from "./lib/git-proxy.mjs";
+import { describeOtelTelemetry } from "./lib/otel-export.mjs";
 import {
   appendLogLine,
   buildStatusSnapshot,
@@ -1260,7 +1261,9 @@ async function commandSetup(argv, workspaceRoot) {
     presets: Object.keys(config.presets ?? {}),
     prompts: [...listNamedPrompts(PLUGIN_ROOT, workspaceRoot).keys()].sort(),
     stateDir: resolveStateDir(workspaceRoot),
-    userConfigPath: userConfigPath()
+    userConfigPath: userConfigPath(),
+    // R7: the single window into the exporter's state; headers only as a count (R8).
+    telemetry: describeOtelTelemetry(process.env)
   };
 
   output(renderSetupReport(payload), payload, Boolean(flags.json));

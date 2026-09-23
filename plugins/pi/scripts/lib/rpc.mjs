@@ -29,6 +29,7 @@ import {
   truncationRetryLimit
 } from "./pi.mjs";
 import { MASKED_MODEL, MASKED_PROVIDER, startCredentialProxy } from "./credential-proxy.mjs";
+import { withoutOtel } from "./otel-export.mjs";
 import { openGitProxy, withGitProxy } from "./git-proxy.mjs";
 import { settleProxyPorts } from "./proxy-bind.mjs";
 import { awaitSandboxSlot, isSandboxed, removeSandboxContainer, resolveLaunch } from "./sandbox.mjs";
@@ -198,7 +199,7 @@ export async function runPiRpcTurn({
 
     const child = spawn(launch.command, launch.args, {
       cwd,
-      env,
+      env: withoutOtel(env),
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32"
     });
