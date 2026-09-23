@@ -211,7 +211,11 @@ export async function exportJobMetrics(job, { env = process.env, db = null, fetc
     try {
       const totals = database
         .prepare(
-          "SELECT COALESCE(SUM(input), 0) AS input, COALESCE(SUM(output), 0) AS output, COALESCE(SUM(cache_read), 0) AS cache_read, COALESCE(SUM(cache_write), 0) AS cache_write, COALESCE(SUM(cost), 0) AS cost FROM jobs WHERE model = ?"
+          // Quoted camelCase aliases on purpose: buildMetricsPayload reads
+          // totals.cacheRead/totals.cacheWrite, and unquoted SQL aliases fold
+          // to lowercase, leaving both cache series filtered out as zero
+          // (the journal columns are snake_case, the payload is not).
+          "SELECT COALESCE(SUM(input), 0) AS input, COALESCE(SUM(output), 0) AS output, COALESCE(SUM(cache_read), 0) AS \"cacheRead\", COALESCE(SUM(cache_write), 0) AS \"cacheWrite\", COALESCE(SUM(cost), 0) AS cost FROM jobs WHERE model = ?"
         )
         .get(job.model);
       const nowNs = BigInt(Date.now()) * 1_000_000n;

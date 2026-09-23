@@ -5,7 +5,13 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
 import { openDatabase, recordJob } from "../plugins/pi/scripts/lib/db.mjs";
+import { runTrackedJob } from "../plugins/pi/scripts/lib/jobs.mjs";
+
+const COMPANION = fileURLToPath(new URL("../plugins/pi/scripts/pi-companion.mjs", import.meta.url));
 import {
   buildMetricsPayload,
   exportJobMetrics,
@@ -136,6 +142,7 @@ test("buildMetricsPayload: форма OTLP/JSON — asInt строкой, asDoub
   const [token, cost] = resourceMetrics.scopeMetrics[0].metrics;
   assert.equal(token.name, "pi.token.usage");
   assert.equal(token.unit, "tokens");
+  assert.equal(token.description, "Number of tokens used");
   assert.equal(token.sum.aggregationTemporality, 2);
   assert.equal(token.sum.isMonotonic, true);
   assert.equal(token.sum.dataPoints.length, 3, "нулевой cacheRead не порождает точку");
@@ -150,6 +157,7 @@ test("buildMetricsPayload: форма OTLP/JSON — asInt строкой, asDoub
   );
   assert.equal(cost.name, "pi.cost.usage");
   assert.equal(cost.unit, "USD");
+  assert.equal(cost.description, "Cost of the pi session in USD");
   assert.equal(typeof cost.sum.dataPoints[0].asDouble, "number");
   assert.equal(cost.sum.dataPoints[0].asDouble, 0.25);
 });
@@ -173,6 +181,42 @@ test("buildMetricsPayload: нулевые тоталы и cost=0 рядов не
     costOnly.resourceMetrics[0].scopeMetrics[0].metrics.map((m) => m.name),
     ["pi.cost.usage"]
   );
+});
+
+test("resolveOtelConfig: http/json протокол и fallback METRICS_PROTOCOL → базовый PROTOCOL (R1)", () => {
+  const base = resolveOtelConfig({
+    PI_OTEL_ENABLE: "1",
+    OTEL_EXPORTER_OTLP_PROTOCOL: "http/json",
+    OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4318"
+  });
+  assert.ok(base, "http/json по базовому PROTOCOL включает экспортёр");
+  assert.equal(base.endpoint, "http://collector:4318/v1/metrics");
+  const metrics = resolveOtelConfig({
+    PI_OTEL_ENABLE: "1",
+    OTEL_EXPORTER_OTLP_METRICS_PROTOCOL: "http/json",
+    OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4318"
+  });
+  assert.ok(metrics, "METRICS_PROTOCOL доступен и когда базовый PROTOCOL не задан");
+});
+
+test("сквозной: ряды cacheRead и cacheCreation доходят до тела (R2, §3)", async () => {
+  const { handle, dir } = temporaryDatabase();
+  try {
+    recordJob(handle, job({ id: "cache-1", usage: { input: 100, output: 10, cacheRead: 300, cacheWrite: 40, cost: 0.05 } }));
+    const capture = await exportAndCapture(handle, "cache-1");
+    const points = JSON.parse(capture.body).resourceMetrics[0].scopeMetrics[0].metrics
+      .find((m) => m.name === "pi.token.usage").sum.dataPoints;
+    const byType = Object.fromEntries(points.map((p) => [
+      p.attributes.find((a) => a.key === "type").value.stringValue,
+      p.asInt
+    ]));
+    assert.equal(byType.cacheRead, "300", "cache_read журнала должен доехать до точки type=cacheRead");
+    assert.equal(byType.cacheCreation, "40", "cache_write журнала должен доехать до точки type=cacheCreation");
+    assert.equal(Object.keys(byType).length, 4, "все четыре ряда токенов присутствуют");
+  } finally {
+    handle.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("splitModelId: model без префикса провайдера, провайдер отдельным лейблом", () => {
@@ -236,9 +280,21 @@ test("сквозной: локальный коллектор получает �
     assert.equal(payload.resourceMetrics[0].scopeMetrics[0].metrics[0].name, "pi.token.usage");
     await collector.close();
 
-    // 500 от коллектора: экспорт молча переживается.
+    // 500 от коллектора: экспорт молча переживается, без ретраев и без
+    // печати в поток прогона — недоступный коллектор не виден пользователю.
     const failing = await startCollector({ statusCode: 500 });
-    await exportJobMetrics(job({ id: "x2" }), { env: { ...ENABLED, OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: failing.url }, db: handle });
+    const output = [];
+    const originalWrite = { out: process.stdout.write, err: process.stderr.write };
+    process.stdout.write = (chunk) => (output.push(String(chunk)), true);
+    process.stderr.write = (chunk) => (output.push(String(chunk)), true);
+    try {
+      await exportJobMetrics(job({ id: "x2" }), { env: { ...ENABLED, OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: failing.url }, db: handle });
+    } finally {
+      process.stdout.write = originalWrite.out;
+      process.stderr.write = originalWrite.err;
+    }
+    assert.equal(failing.seen.length, 1, "один запрос, ретраев нет (R6)");
+    assert.equal(output.join(""), "", "500-сценарий ничего не печатает (R6)");
     await failing.close();
 
     // Коллектор, не отвечающий вовсе: AbortSignal рвёт запрос, исключений нет.
@@ -277,10 +333,13 @@ test("без PI_OTEL_ENABLE экспортёра нет: ни fetch, ни чте
     }
   });
   assert.equal(fetched, 0, "no-op не делает сетевых вызовов");
-  // Журнал не открылся — экспорт тихо пропускается, как и весь CLI (recordJobSafely).
+  // Журнал, который не открывается: PI_PLUGIN_DB лежит под обычным ФАЙЛОМ,
+  // где mkdirSync обязан упасть (ENOTDIR) — экспорт тихо пропускается, как и
+  // весь CLI через recordJobSafely.
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "pi-otel-noop-"));
+  fs.writeFileSync(path.join(scratch, "blocker"), "not a directory");
   const previous = process.env.PI_PLUGIN_DB;
-  process.env.PI_PLUGIN_DB = path.join(scratch, "absent", "jobs.db");
+  process.env.PI_PLUGIN_DB = path.join(scratch, "blocker", "jobs.db");
   try {
     await exportJobMetrics(job({}), {
       env: { PI_OTEL_ENABLE: "1", OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: "http://127.0.0.1:1/v1/metrics" },
@@ -296,6 +355,159 @@ test("без PI_OTEL_ENABLE экспортёра нет: ни fetch, ни чте
     fs.rmSync(scratch, { recursive: true, force: true });
   }
   assert.equal(fetched, 0, "неоткрывшийся журнал выключает экспорт");
+});
+
+/** Свой журнал на каждый прогон: exportJobMetrics и recordJobSafely читают process.env. */
+function withProcessJournal(run) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-otel-tracked-"));
+  const previous = { db: process.env.PI_PLUGIN_DB, enable: process.env.PI_OTEL_ENABLE, endpoint: process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT };
+  process.env.PI_PLUGIN_DB = path.join(dir, "jobs.db");
+  return run(dir).finally(() => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+}
+
+/** runTrackedJob уводит fetch в никуда; ждём его завершения опросом коллектора. */
+async function waitForSeen(collector, count = 1, timeoutMs = 5_000) {
+  const started = Date.now();
+  while (collector.seen.length < count) {
+    if (Date.now() - started > timeoutMs) {
+      throw new Error(`коллектор не получил ${count} запрос(ов) за ${timeoutMs} мс`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+/** Минимальный execution, по форме совпадающий с тем, что возвращают движки. */
+function execution(overrides = {}) {
+  return {
+    exitStatus: 0,
+    text: "готово",
+    model: job().model,
+    usage: { input: 120, output: 30, cost: 0.2 },
+    errors: [],
+    turns: 1,
+    ...overrides
+  };
+}
+
+test("финализация: fetch после recordJobSafely, для completed, failed и cancelled (R3)", async () => {
+  await withProcessJournal(async (dir) => {
+    const cases = [
+      ["completed", { runner: () => execution() }],
+      ["failed", { runner: () => { throw new Error("модель упала"); } }],
+      ["cancelled", { runner: () => execution({ aborted: true, exitStatus: 1, text: null, usage: { input: 5, output: 0, cost: 0 } }) }]
+    ];
+    for (const [status, overrides] of cases) {
+      const collector = await startCollector();
+      process.env.PI_OTEL_ENABLE = "1";
+      process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT = collector.url;
+      const workspaceRoot = fs.mkdtempSync(path.join(dir, `ws-${status}-`));
+      const running = {
+        id: `tracked-${status}`,
+        kind: "delegate",
+        workspaceRoot,
+        logFile: path.join(workspaceRoot, "job.log"),
+        model: job().model,
+        prompt: "задача"
+      };
+      try {
+        if (status === "failed") {
+          await assert.rejects(() => runTrackedJob(running, overrides.runner), /модель упала/);
+        } else {
+          await runTrackedJob(running, overrides.runner);
+        }
+        await waitForSeen(collector);
+        const payload = JSON.parse(collector.seen[0].body);
+        const tokenMetric = payload.resourceMetrics[0].scopeMetrics[0].metrics.find((m) => m.name === "pi.token.usage");
+        assert.ok(tokenMetric, `${status}: метрика токенов экспортирована`);
+        // Кумулятив уже включает этот прогон: запись в журнале случилась до fetch.
+        const input = tokenMetric.sum.dataPoints.find((p) =>
+          p.attributes.some((a) => a.key === "type" && a.value.stringValue === "input")
+        );
+        // Журнал один на весь цикл, поэтому кумулятив растёт от кейса к кейсу:
+        // failed пишет в журнал без usage (0 токенов), cancelled — свои 5.
+        const expected = status === "cancelled" ? 125 : 120;
+        assert.equal(input.asInt, String(expected), `${status}: usage прогона уже в агрегате`);
+        assert.equal(collector.seen.length, 1, `${status}: ровно один экспорт`);
+      } finally {
+        await collector.close();
+        fs.rmSync(workspaceRoot, { recursive: true, force: true });
+      }
+    }
+  });
+});
+
+function runSetup(extraEnv) {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-otel-setup-"));
+  const base = { ...process.env, CLAUDE_PLUGIN_DATA: dataDir, PI_PLUGIN_DB: path.join(dataDir, "jobs.db") };
+  for (const key of Object.keys(base)) {
+    if (key === "PI_OTEL_ENABLE" || key.startsWith("OTEL_EXPORTER")) delete base[key];
+  }
+  return {
+    dataDir,
+    result: spawnSync(process.execPath, [COMPANION, "setup", "--json"], {
+      encoding: "utf8",
+      cwd: dataDir,
+      env: { ...base, ...extraEnv },
+      timeout: 60_000
+    })
+  };
+}
+
+function setupTelemetry(extraEnv) {
+  const { dataDir, result } = runSetup(extraEnv);
+  try {
+    assert.equal(result.status, 0, `setup завершился: ${result.stderr}`);
+    const start = result.stdout.indexOf("{");
+    const payload = JSON.parse(result.stdout.slice(start));
+    return payload.telemetry;
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+}
+
+test("setup --json: telemetry видна в обоих состояниях (R7)", () => {
+  const enabled = setupTelemetry({
+    PI_OTEL_ENABLE: "1",
+    OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: "http://127.0.0.1:4318/v1/metrics"
+  });
+  assert.equal(enabled.enabled, true);
+  assert.equal(enabled.endpoint, "http://127.0.0.1:4318/v1/metrics");
+
+  const off = setupTelemetry({});
+  assert.equal(off.enabled, false);
+  assert.match(off.reason, /PI_OTEL_ENABLE не задан/);
+
+  const grpc = setupTelemetry({
+    PI_OTEL_ENABLE: "1",
+    OTEL_EXPORTER_OTLP_PROTOCOL: "grpc",
+    OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4317"
+  });
+  assert.equal(grpc.enabled, false);
+  assert.match(grpc.reason, /grpc/);
+});
+
+test("setup --json: значение заголовков не попадает в вывод (R8)", () => {
+  const { dataDir, result } = runSetup({
+    PI_OTEL_ENABLE: "1",
+    OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: "http://127.0.0.1:4318/v1/metrics",
+    OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Bearer s3cr3t-token"
+  });
+  try {
+    assert.equal(result.status, 0, result.stderr);
+    const output = result.stdout + result.stderr;
+    assert.ok(!output.includes("Bearer"), "значение заголовка утекло в вывод setup");
+    assert.ok(!output.includes("s3cr3t-token"), "токен утекло в вывод setup");
+    const payload = JSON.parse(result.stdout.slice(result.stdout.indexOf("{")));
+    assert.equal(payload.telemetry.headers, 1, "выводится только факт наличия заголовков");
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
 });
 
 test("R5: окружение дочернего pi глушит унаследованный PI_OTEL_ENABLE", () => {
