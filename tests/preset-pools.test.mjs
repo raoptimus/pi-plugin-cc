@@ -742,6 +742,17 @@ test("the run path resolves a models preset end to end", async (t) => {
 
   const { buildRunSettings } = await import("../plugins/pi/scripts/pi-companion.mjs");
   const config = normalizeConfigLayer(ownerFormConfig());
+  // Preflight refuses mounts whose host side does not exist (B85-12), so the
+  // stub services mount real temporary directories instead of /srv/*.
+  const mountDirs = [];
+  for (const profile of Object.values(config.sandboxProfiles ?? {})) {
+    profile.mounts = (profile.mounts ?? []).map((mount) => {
+      const target = String(mount).split(":")[1];
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-pools-mount-"));
+      mountDirs.push(dir);
+      return `${dir}:${target}:ro`;
+    });
+  }
   config.presets.role.systemPrompt = "reviewer";
   const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-pools-"));
   try {
@@ -762,6 +773,7 @@ test("the run path resolves a models preset end to end", async (t) => {
     assert.equal(settings.poolWaitMs, 30000);
   } finally {
     fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    for (const dir of mountDirs) fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

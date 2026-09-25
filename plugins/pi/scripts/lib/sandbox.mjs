@@ -279,10 +279,52 @@ function expandHome(value, homeDir) {
  */
 function resolveMountSource(mount, homeDir, cwd) {
   const separator = String(mount).indexOf(":");
-  const source = expandHome(String(mount).slice(0, separator), homeDir);
   const rest = String(mount).slice(separator);
+  return `${mountHostSide(mount, homeDir, cwd)}${rest}`;
+}
+
+/**
+ * The host side of a mount exactly as docker will see it: `~` expanded,
+ * a relative path resolved against the workspace, named volumes as-is.
+ *
+ * Shared with the pre-run verification so the check judges the same path the
+ * container will actually receive, not a re-derived approximation of it.
+ */
+function mountHostSide(mount, homeDir, cwd) {
+  const separator = String(mount).indexOf(":");
+  const source = expandHome(String(mount).slice(0, separator), homeDir);
   const relative = source.startsWith("./") || source.startsWith("../") || source === "." || source === "..";
-  return `${relative ? path.resolve(cwd, source) : source}${rest}`;
+  return relative ? path.resolve(cwd, source) : source;
+}
+
+/**
+ * Mounts whose host side does not exist and therefore will not arrive.
+ *
+ * Docker never refuses a missing bind-mount source: it silently creates an
+ * empty directory — on the daemon's filesystem, which with a rootless or
+ * nested daemon is not the one the caller looks at. The agent then writes
+ * its report into a container-only analog of the requested path, reports
+ * success, and the host finds nothing: three runs across two epics lost
+ * their reports this way and were recovered by hand from the responses.
+ * Verified before the job record exists, so a misnamed path costs nothing.
+ */
+export function missingMountSources(sandbox, { homeDir = os.homedir(), cwd = "." } = {}) {
+  if (!isSandboxed(sandbox)) {
+    return [];
+  }
+  const missing = [];
+  for (const mount of sandbox.mounts ?? []) {
+    const hostSide = mountHostSide(mount, homeDir, cwd);
+    // A named volume has no host side to check; docker reads a source with no
+    // path marker as a volume name, and those are created on purpose.
+    if (!/^[~./]/.test(hostSide)) {
+      continue;
+    }
+    if (!fs.existsSync(hostSide)) {
+      missing.push({ mount: String(mount), hostPath: hostSide });
+    }
+  }
+  return missing;
 }
 
 /**
@@ -774,7 +816,7 @@ function firstLine(text) {
  * Check that the sandbox can actually start before a job is created — a
  * missing daemon or image is a setup problem, not a failed run.
  */
-export function sandboxPreflight(sandbox) {
+export function sandboxPreflight(sandbox, { cwd = "." } = {}) {
   if (!isSandboxed(sandbox)) {
     return { ok: true, errors: [], warnings: [] };
   }
@@ -799,6 +841,14 @@ export function sandboxPreflight(sandbox) {
   if (image.status !== 0) {
     errors.push(
       `Sandbox image \`${sandbox.image}\` is missing. Build it with \`pi-companion.mjs sandbox build\`.`
+    );
+  }
+
+  for (const missing of missingMountSources(sandbox, { cwd })) {
+    errors.push(
+      `Mount "${missing.mount}" will not mount: the host path "${missing.hostPath}" does not exist. ` +
+        "Docker would silently create an empty directory on the daemon's side, the agent would write into " +
+        "a container-only analog of the path, and nothing would appear on the host. Create the directory first."
     );
   }
 

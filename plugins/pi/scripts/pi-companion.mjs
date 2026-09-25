@@ -724,7 +724,9 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
 
     // A missing daemon or image is a setup problem: fail before a job record
     // exists rather than recording a run that never started.
-    const preflight = sandboxPreflight(sandbox);
+    // Mount sources are judged against the run root, the same tree docker
+    // resolves a relative `-v` source against at container creation.
+    const preflight = sandboxPreflight(sandbox, { cwd: runRoot });
     if (!preflight.ok) {
       throw new Error(`Sandbox is not ready.\n- ${preflight.errors.join("\n- ")}`);
     }
@@ -1253,7 +1255,8 @@ async function commandSetup(argv, workspaceRoot) {
       configured: describeSandbox(configuredSandbox),
       image: isSandboxed(configuredSandbox) ? configuredSandbox.image : DEFAULT_SANDBOX_IMAGE,
       ready: sandboxPreflight(
-        isSandboxed(configuredSandbox) ? configuredSandbox : { mode: "docker", image: DEFAULT_SANDBOX_IMAGE }
+        isSandboxed(configuredSandbox) ? configuredSandbox : { mode: "docker", image: DEFAULT_SANDBOX_IMAGE },
+        { cwd: workspaceRoot }
       ).ok
     },
     configSources: sources,
