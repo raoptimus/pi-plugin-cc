@@ -78,3 +78,35 @@ test("preflight fails before a job record exists, with a fixable message", () =>
   assert.match(mountErrors[0], /does not exist/);
   assert.match(mountErrors[0], /container-only analog/);
 });
+
+test("the run path wires the run root into preflight, so relative mounts resolve there", async () => {
+  const { buildRunSettings } = await import("../plugins/pi/scripts/pi-companion.mjs");
+
+  const runRoot = tempDir();
+  const workspaceRoot = tempDir();
+  fs.mkdirSync(path.join(runRoot, "exists"));
+  try {
+    // A missing run root must be a refusal, not a throw-shaped success: the
+    // wiring of `cwd` here is what keeps `./absent` from being judged against
+    // the process cwd instead of the tree the agent actually runs in.
+    assert.throws(
+      () =>
+        buildRunSettings({
+          command: "delegate",
+          flags: { sandbox: "docker", mount: ["./exists:/x", "./absent:/y"] },
+          workspaceRoot,
+          runRoot,
+          config: {}
+        }),
+      (error) => {
+        const lines = String(error.message).split("\n").filter((line) => line.startsWith("- Mount "));
+        if (lines.length !== 1) return false;
+        return lines[0].includes(path.join(runRoot, "absent")) && !lines[0].includes("exists");
+      },
+      `expected exactly one mount error, for ./absent under ${runRoot}`
+    );
+  } finally {
+    fs.rmSync(runRoot, { recursive: true, force: true });
+    fs.rmSync(workspaceRoot, { recursive: true, force: true });
+  }
+});

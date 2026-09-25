@@ -824,6 +824,17 @@ export function sandboxPreflight(sandbox, { cwd = "." } = {}) {
   const errors = [];
   const warnings = [];
 
+  // Mount existence needs no daemon and is judged before the docker checks so
+  // preflight reports every setup problem at once, even on a machine where the
+  // binary or daemon is absent.
+  for (const missing of missingMountSources(sandbox, { cwd })) {
+    errors.push(
+      `Mount "${missing.mount}" will not mount: the host path "${missing.hostPath}" does not exist. ` +
+        "Docker would silently create an empty directory on the daemon's side, the agent would write into " +
+        "a container-only analog of the path, and nothing would appear on the host. Create the directory first."
+    );
+  }
+
   if (!binaryAvailable("docker")) {
     errors.push("`docker` was not found on PATH. Install Docker, or run without `--sandbox`.");
     return { ok: false, errors, warnings };
@@ -841,14 +852,6 @@ export function sandboxPreflight(sandbox, { cwd = "." } = {}) {
   if (image.status !== 0) {
     errors.push(
       `Sandbox image \`${sandbox.image}\` is missing. Build it with \`pi-companion.mjs sandbox build\`.`
-    );
-  }
-
-  for (const missing of missingMountSources(sandbox, { cwd })) {
-    errors.push(
-      `Mount "${missing.mount}" will not mount: the host path "${missing.hostPath}" does not exist. ` +
-        "Docker would silently create an empty directory on the daemon's side, the agent would write into " +
-        "a container-only analog of the path, and nothing would appear on the host. Create the directory first."
     );
   }
 
