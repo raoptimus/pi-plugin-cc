@@ -49,6 +49,11 @@ ln -s "$PWD/skills/pi" ~/.claude/skills/pi
 /pi:setup
 ```
 
+### Metrics (optional)
+
+To see tokens and cost in a collector (Prometheus, Grafana), add a few variables to your shell —
+see [docs/otel-setup.md](docs/otel-setup.md).
+
 ### `pia` — the same companion from a shell
 
 Every slash command is a subcommand of one node script, and outside Claude Code — in a brief, in a hook, in a terminal — that script otherwise has to be named by a fifty-character path. [`bin/pia`](bin/pia) is a shim that works out the path itself, following symlinks, so it serves a checkout and an installed skill alike:
