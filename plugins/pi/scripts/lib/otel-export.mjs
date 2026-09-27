@@ -10,6 +10,16 @@ import { openDatabase } from "./db.mjs";
  * cumulative counters from there — the Bearer token never approaches the
  * agent. Transport is hand-rolled on node: built-ins because this package has
  * no dependencies and must not gain any.
+ *
+ * Configuration lives in PI_OTEL_EXPORTER_OTLP_* variables, not the standard
+ * OTEL_* ones: the companion is spawned by Claude Code, which strips every
+ * OTEL_* variable from child-process environments (PI_* passes through), so a
+ * standard-only setup never reaches this exporter at all. The standard OTEL_*
+ * variables remain supported as a fallback so a pre-existing shell setup keeps
+ * working. The standard per-signal variables must NOT be set globally for the
+ * companion's benefit: every OTel client reads them, so Claude Code would push
+ * gRPC metrics at an HTTP port, and @desek/pi-opentelemetry always appends
+ * /v1/metrics to the address and would POST to .../v1/metrics/v1/metrics.
  */
 
 const START_TIME_KEY = "otel_start_time";
@@ -53,9 +63,10 @@ function httpFamily(protocol) {
 }
 
 /**
- * R1: standard `OTEL_*` variables, no-op unless `PI_OTEL_ENABLE` is truthy.
- * Returns null when the exporter must stay silent; there is no probe and no
- * retry — a cumulative series catches up on the next export anyway.
+ * R1: PI_OTEL_EXPORTER_OTLP_* first (Claude Code strips plain OTEL_* from its
+ * child processes), standard OTEL_* as fallback. No-op unless PI_OTEL_ENABLE is
+ * truthy. Returns null when the exporter must stay silent; there is no probe
+ * and no retry — a cumulative series catches up on the next export anyway.
  */
 export function resolveOtelConfig(env = process.env) {
   if (!truthy(env.PI_OTEL_ENABLE)) {
@@ -64,7 +75,12 @@ export function resolveOtelConfig(env = process.env) {
   const protocol = env.OTEL_EXPORTER_OTLP_METRICS_PROTOCOL ?? env.OTEL_EXPORTER_OTLP_PROTOCOL ?? "";
   const metricsEndpoint = env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT;
   let endpoint = null;
-  if (metricsEndpoint) {
+  let source = "otel";
+  if (env.PI_OTEL_EXPORTER_OTLP_ENDPOINT) {
+    // A PI_ endpoint is a full URL, used as-is whatever the protocol says.
+    endpoint = env.PI_OTEL_EXPORTER_OTLP_ENDPOINT;
+    source = "pi";
+  } else if (metricsEndpoint) {
     // A per-signal endpoint is a full URL, used as-is whatever the protocol says.
     endpoint = metricsEndpoint;
   } else if (env.OTEL_EXPORTER_OTLP_ENDPOINT && httpFamily(protocol)) {
@@ -73,6 +89,13 @@ export function resolveOtelConfig(env = process.env) {
   if (!endpoint) {
     return null;
   }
+  // Headers follow the endpoint's source: an endpoint that needs auth paired
+  // with silently empty headers would fail the export with no visible reason,
+  // so when the PI_ headers are absent the standard ones are still honored.
+  const headersRaw =
+    source === "pi"
+      ? env.PI_OTEL_EXPORTER_OTLP_HEADERS ?? env.OTEL_EXPORTER_OTLP_METRICS_HEADERS ?? env.OTEL_EXPORTER_OTLP_HEADERS
+      : env.OTEL_EXPORTER_OTLP_METRICS_HEADERS ?? env.OTEL_EXPORTER_OTLP_HEADERS;
   const resource = {
     ...parseKeyValueList(env.OTEL_RESOURCE_ATTRIBUTES),
     "service.name": env.OTEL_SERVICE_NAME || DEFAULT_SERVICE_NAME,
@@ -80,25 +103,36 @@ export function resolveOtelConfig(env = process.env) {
     // emits for direct (non-delegated) runs on the same host.
     "pi.runner": "companion"
   };
-  return { endpoint, headers: parseKeyValueList(env.OTEL_EXPORTER_OTLP_METRICS_HEADERS ?? env.OTEL_EXPORTER_OTLP_HEADERS), resource };
+  return { endpoint, source, headers: parseKeyValueList(headersRaw), resource };
 }
 
 /** R7: the only place the exporter's state is visible. Headers appear as a count, never their value (R8). */
 export function describeOtelTelemetry(env = process.env) {
   if (!truthy(env.PI_OTEL_ENABLE)) {
-    return { enabled: false, endpoint: null, headers: 0, reason: "PI_OTEL_ENABLE не задан" };
+    return { enabled: false, source: null, endpoint: null, headers: 0, reason: "PI_OTEL_ENABLE не задан" };
   }
   const protocol = env.OTEL_EXPORTER_OTLP_METRICS_PROTOCOL ?? env.OTEL_EXPORTER_OTLP_PROTOCOL ?? "";
   const config = resolveOtelConfig(env);
   if (!config) {
+    // PI_OTEL_EXPORTER_OTLP_ENDPOINT alone always produces a config, so being
+    // here means only the standard variables were seen (or not at all).
     const reason =
       env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT || env.OTEL_EXPORTER_OTLP_ENDPOINT
         ? `протокол ${protocol || "(пусто)"} не http-семейства, а metrics-endpoint не задан`
-        : "OTEL_EXPORTER_OTLP_ENDPOINT не задан";
-    return { enabled: false, endpoint: env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT ?? env.OTEL_EXPORTER_OTLP_ENDPOINT ?? null, headers: 0, reason };
+        // Claude Code strips OTEL_* from child processes, so a shell-only setup
+        // silently never reaches the companion — point at the PI_ variables.
+        : "OTEL_EXPORTER_OTLP_ENDPOINT не задан; задайте PI_OTEL_EXPORTER_OTLP_ENDPOINT (Claude Code не передаёт OTEL_* дочерним процессам)";
+    return {
+      enabled: false,
+      source: null,
+      endpoint: env.PI_OTEL_EXPORTER_OTLP_ENDPOINT ?? env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT ?? env.OTEL_EXPORTER_OTLP_ENDPOINT ?? null,
+      headers: 0,
+      reason
+    };
   }
   return {
     enabled: true,
+    source: config.source,
     endpoint: config.endpoint,
     headers: Object.keys(config.headers).length ? 1 : 0,
     reason: null

@@ -78,7 +78,7 @@ export function renderSetupReport(report) {
     const t = report.telemetry;
     lines.push(
       t.enabled
-        ? `- Telemetry: **enabled** → \`${t.endpoint}\` · headers: ${t.headers}`
+        ? `- Telemetry: **enabled** (source: ${t.source}) → \`${t.endpoint}\` · headers: ${t.headers}`
         : `- Telemetry: off (${t.reason})`
     );
   }

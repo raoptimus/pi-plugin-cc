@@ -14,6 +14,7 @@ import { runTrackedJob } from "../plugins/pi/scripts/lib/jobs.mjs";
 const COMPANION = fileURLToPath(new URL("../plugins/pi/scripts/pi-companion.mjs", import.meta.url));
 import {
   buildMetricsPayload,
+  describeOtelTelemetry,
   exportJobMetrics,
   parseKeyValueList,
   resolveOtelConfig,
@@ -516,4 +517,68 @@ test("R5: окружение дочернего pi глушит унаследо
   // Переменной не было — окружение не перекраивается.
   const untouched = { HOME: "/h" };
   assert.equal(withoutOtel(untouched), untouched);
+});
+
+test("resolveOtelConfig: PI_OTEL_EXPORTER_OTLP_ENDPOINT выигрывает у стандартных OTEL_*", () => {
+  const config = resolveOtelConfig({
+    PI_OTEL_ENABLE: "1",
+    PI_OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4318/v1/metrics",
+    PI_OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Bearer pi-token",
+    OTEL_EXPORTER_OTLP_PROTOCOL: "grpc",
+    OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4317",
+    OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: "http://elsewhere:9/v1/metrics",
+    OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Bearer otel-token"
+  });
+  assert.equal(config.source, "pi");
+  assert.equal(config.endpoint, "http://collector:4318/v1/metrics", "PI_-endpoint используется как есть, протокол не проверяется");
+  assert.equal(config.headers.Authorization, "Bearer pi-token");
+});
+
+test("resolveOtelConfig: без PI_-переменных прежнее поведение по OTEL_* (обратная совместимость)", () => {
+  const config = resolveOtelConfig({ ...ENABLED, OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4318" });
+  assert.equal(config.source, "otel");
+  assert.equal(config.endpoint, "http://collector:30318/v1/metrics");
+  assert.equal(config.headers.Authorization, "Bearer t0k3n");
+});
+
+test("resolveOtelConfig: заголовки следуют источнику endpoint — PI_ без заголовков падает на стандартные, а не молчит", () => {
+  const fallback = resolveOtelConfig({
+    PI_OTEL_ENABLE: "1",
+    PI_OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4318/v1/metrics",
+    OTEL_EXPORTER_OTLP_METRICS_HEADERS: "Authorization=Bearer otel-metrics-token"
+  });
+  assert.equal(fallback.headers.Authorization, "Bearer otel-metrics-token");
+  const baseFallback = resolveOtelConfig({
+    PI_OTEL_ENABLE: "1",
+    PI_OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4318/v1/metrics",
+    OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Bearer otel-base-token"
+  });
+  assert.equal(baseFallback.headers.Authorization, "Bearer otel-base-token");
+  // Источник otel не видит PI_-заголовков: смешивание источников запрещено.
+  const otelOnly = resolveOtelConfig({
+    PI_OTEL_ENABLE: "1",
+    OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4318",
+    PI_OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Bearer pi-token"
+  });
+  assert.deepEqual(otelOnly.headers, {});
+});
+
+test("describeOtelTelemetry: источник конфигурации и подсказка при выключенном экспорте", () => {
+  const pi = describeOtelTelemetry({
+    PI_OTEL_ENABLE: "1",
+    PI_OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4318/v1/metrics",
+    PI_OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Bearer s3cr3t"
+  });
+  assert.equal(pi.source, "pi");
+  assert.equal(pi.enabled, true);
+  assert.ok(!JSON.stringify(pi).includes("s3cr3t"), "значение заголовка не попадает в describe");
+  assert.equal(pi.headers, 1);
+
+  const otel = describeOtelTelemetry({ ...ENABLED });
+  assert.equal(otel.source, "otel");
+
+  const hinted = describeOtelTelemetry({ PI_OTEL_ENABLE: "1" });
+  assert.equal(hinted.enabled, false);
+  assert.match(hinted.reason, /PI_OTEL_EXPORTER_OTLP_ENDPOINT/);
+  assert.match(hinted.reason, /Claude Code/);
 });

@@ -903,3 +903,22 @@ test("equipment outside the container is reported as a gap, not just as prose", 
   // npm:/git: sources resolve inside the container and are nobody's gap.
   assert.deepEqual(sandboxMountGaps(sandbox, { workspaceRoot: "/work", skills: ["npm:some-skill"] }), []);
 });
+
+test("telemetry credentials never reach the container: PI_OTEL_* headers are not forwarded", () => {
+  // The container env is built only from the sandbox profile's explicit -e
+  // entries; the companion's own OTLP headers stay in the host process.
+  const args = buildDockerRunArgs({
+    sandbox: normalizeSandbox("docker"),
+    cwd: "/work",
+    identity: IDENTITY,
+    homeDir: "/nonexistent-home",
+    env: {
+      PI_OTEL_ENABLE: "1",
+      PI_OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4318/v1/metrics",
+      PI_OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Bearer s3cr3t-token"
+    }
+  });
+  const containerEnv = args.filter((arg) => args[args.indexOf(arg) - 1] === "-e");
+  assert.ok(!containerEnv.some((entry) => entry.startsWith("PI_OTEL_")), "PI_OTEL_* не передаётся в контейнер");
+  assert.ok(!args.join("\n").includes("s3cr3t-token"), "токен не попал в docker run args");
+});
