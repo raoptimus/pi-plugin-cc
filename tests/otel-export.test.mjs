@@ -491,6 +491,7 @@ test("setup --json: telemetry видна в обоих состояниях (R7)
   });
   assert.equal(grpc.enabled, false);
   assert.match(grpc.reason, /grpc/);
+  assert.match(grpc.reason, /PI_OTEL_EXPORTER_OTLP_ENDPOINT/);
 });
 
 test("setup --json: значение заголовков не попадает в вывод (R8)", () => {

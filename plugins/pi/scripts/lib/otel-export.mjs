@@ -118,7 +118,9 @@ export function describeOtelTelemetry(env = process.env) {
     // here means only the standard variables were seen (or not at all).
     const reason =
       env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT || env.OTEL_EXPORTER_OTLP_ENDPOINT
-        ? `протокол ${protocol || "(пусто)"} не http-семейства, а metrics-endpoint не задан`
+        // Naming the standard per-signal variable here would steer the user into
+        // setting it globally, which breaks Claude Code and the pi extension.
+        ? `протокол ${protocol || "(пусто)"} не http-семейства; задайте PI_OTEL_EXPORTER_OTLP_ENDPOINT, а не глобальный OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`
         // Claude Code strips OTEL_* from child processes, so a shell-only setup
         // silently never reaches the companion — point at the PI_ variables.
         : "OTEL_EXPORTER_OTLP_ENDPOINT не задан; задайте PI_OTEL_EXPORTER_OTLP_ENDPOINT (Claude Code не передаёт OTEL_* дочерним процессам)";
