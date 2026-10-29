@@ -54,10 +54,13 @@ update: validate update-cc update-pi ## Copy the current checkout into BOTH harn
 # installs origin/main. Nothing in the output says so — the only visible symptom
 # is an edit that never takes effect. Hence a check before anything is touched,
 # and a non-zero exit rather than a warning: a silent failure is what this cost.
+# The CLI labels a local source `Directory (...)` in older releases and
+# `Folder (...)` in newer ones; matching only one turns the check into a false
+# FATAL on the very registration it is meant to confirm.
 check-marketplace: ## Fail unless `$(MARKETPLACE)` is registered as THIS directory
 	@src=$$($(CLAUDE) plugin marketplace list 2>/dev/null | awk -v m="$(MARKETPLACE)" '$$NF==m{getline; print; exit}'); \
 	case "$$src" in \
-		*"Directory ($(ROOT))"*) echo "mp-check: $(MARKETPLACE) -> $(ROOT) (this checkout)" ;; \
+		*"Directory ($(ROOT))"*|*"Folder ($(ROOT))"*) echo "mp-check: $(MARKETPLACE) -> $(ROOT) (this checkout)" ;; \
 		"") echo "mp-check: FATAL — marketplace $(MARKETPLACE) is not registered"; \
 		    echo "  register this checkout with: make install"; \
 		    exit 1 ;; \
