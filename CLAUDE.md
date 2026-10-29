@@ -25,7 +25,10 @@ There is no linter, formatter or build step. `npm test` is the whole gate.
 
 `tests/git-proxy.e2e.test.mjs` shells out to the real `git` binary; `db.test.mjs` and the journal
 need Node 22.3+ (`node:sqlite`). Tests isolate themselves via `CLAUDE_PLUGIN_DATA`, `PI_PLUGIN_DB`,
-`XDG_DATA_HOME` and `GIT_CONFIG_GLOBAL`; `PI_PLUGIN_BINARY` points the runtime at a generated
+`XDG_DATA_HOME` and `GIT_CONFIG_GLOBAL`; `npm test` preloads `tests/isolate-env.mjs`, which strips
+`PI_OTEL_*`/`OTEL_EXPORTER*` so no run exports to the developer's collector (a bare `node --test`
+skips that preload). The git tests need git 2.32+ first in `PATH` (`GIT_CONFIG_GLOBAL`, `init -b`).
+`PI_PLUGIN_BINARY` points the runtime at a generated
 `fake-pi.mjs` (tests/recovery, tests/loop-nudge) driven by `PI_FAKE_*` env knobs, so no test ever
 spends a token.
 

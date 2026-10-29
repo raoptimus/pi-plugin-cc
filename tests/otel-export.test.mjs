@@ -358,10 +358,25 @@ test("без PI_OTEL_ENABLE экспортёра нет: ни fetch, ни чте
   assert.equal(fetched, 0, "неоткрывшийся журнал выключает экспорт");
 });
 
-/** Свой журнал на каждый прогон: exportJobMetrics и recordJobSafely читают process.env. */
+/** Переменные экспортёра из окружения разработчика: тест обязан их не видеть. */
+function isOtelKey(key) {
+  return key.startsWith("PI_OTEL_") || key.startsWith("OTEL_EXPORTER");
+}
+
+/**
+ * Свой журнал на каждый прогон: exportJobMetrics и recordJobSafely читают process.env.
+ * Унаследованные PI_OTEL_* вычищаются: PI_OTEL_EXPORTER_OTLP_ENDPOINT выигрывает у
+ * OTEL_EXPORTER_OTLP_METRICS_ENDPOINT теста, и с настроенным шеллом экспорт уходил
+ * на настоящий коллектор разработчика, а тестовый ждал впустую.
+ */
 function withProcessJournal(run) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-otel-tracked-"));
-  const previous = { db: process.env.PI_PLUGIN_DB, enable: process.env.PI_OTEL_ENABLE, endpoint: process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT };
+  const previous = { PI_PLUGIN_DB: process.env.PI_PLUGIN_DB, OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: undefined };
+  for (const key of Object.keys(process.env)) {
+    if (!isOtelKey(key)) continue;
+    previous[key] = process.env[key];
+    delete process.env[key];
+  }
   process.env.PI_PLUGIN_DB = path.join(dir, "jobs.db");
   return run(dir).finally(() => {
     for (const [key, value] of Object.entries(previous)) {
@@ -447,7 +462,7 @@ function runSetup(extraEnv) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-otel-setup-"));
   const base = { ...process.env, CLAUDE_PLUGIN_DATA: dataDir, PI_PLUGIN_DB: path.join(dataDir, "jobs.db") };
   for (const key of Object.keys(base)) {
-    if (key === "PI_OTEL_ENABLE" || key.startsWith("OTEL_EXPORTER")) delete base[key];
+    if (isOtelKey(key)) delete base[key];
   }
   return {
     dataDir,
