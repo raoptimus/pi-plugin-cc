@@ -1,5 +1,5 @@
 {
-  "trustProjectConfig": true,
+  "trustProjectConfig": false,
   "defaults": {
     "model": "vllm/Qwen3.8-27B",
     "thinking": "off",
@@ -15,16 +15,7 @@
       "deepseek": "12h"
     }
   },
-  "gitProxy": {
-    "gitlab.example.com": {
-      "user": "oauth2",
-      "tokenCommand": "echo GIT_TOKEN=$MY_GIT_TOKEN"
-    },
-    "10.0.0.1": {
-      "user": "oauth2",
-      "tokenCommand": "echo GIT_TOKEN=$MY_SELFHOSTED_TOKEN"
-    }
-  },
+  "gitProxy": {},
   "sandboxServices": [
     {
       "id": "agent-base",
@@ -48,7 +39,6 @@
       "env": [
         "PATH=/pi-skills/vision/scripts:/usr/local/cargo/bin:/usr/local/go/bin:/pi-gobin:/gobin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "GOPROXY=file:///host-gomod,https://proxy.golang.org,direct",
-        "GOPRIVATE=gitlab.gid.team,157.22.252.213,github.com,gitlab.loc",
         "GOFLAGS=-mod=mod",
         "GIT_TERMINAL_PROMPT=0",
         "CARGO_TERM_COLOR=never",
@@ -168,12 +158,70 @@
           }
         }
       ]
+    },
+    {
+      "pool": "openai-codex",
+      "limit": 1,
+      "priority": 10,
+      "models": [
+        {
+          "id": "codex-gpt-6.1-sol-medium",
+          "provider": "openai-codex",
+          "name": "gpt-6.1-sol",
+          "thinking": "medium"
+        },
+        {
+          "id": "codex-gpt-6.1-sol-high",
+          "provider": "openai-codex",
+          "name": "gpt-6.1-sol",
+          "thinking": "high"
+        },
+        {
+          "id": "codex-gpt-6.1-terra-medium",
+          "provider": "openai-codex",
+          "name": "gpt-6.1-terra",
+          "thinking": "medium"
+        },
+        {
+          "id": "codex-gpt-6.1-terra-high",
+          "provider": "openai-codex",
+          "name": "gpt-6.1-terra",
+          "thinking": "high"
+        },
+        {
+          "id": "codex-gpt-6-astra-high",
+          "provider": "openai-codex",
+          "name": "gpt-6-astra",
+          "thinking": "high"
+        }
+      ]
+    },
+    {
+      "pool": "ollama-cloud",
+      "limit": 3,
+      "models": [
+        {
+          "id": "ollama-deepseek-v4.1-flash",
+          "provider": "ollama-cloud",
+          "name": "deepseek-v4.1-flash",
+          "thinking": "low"
+        },
+        {
+          "id": "ollama-glm-5.3",
+          "provider": "ollama-cloud",
+          "name": "glm-5.3",
+          "thinking": "high"
+        }
+      ],
+      "priority": 10
     }
   ],
   "presets": [
     {
       "id": "go-developer",
       "models": [
+        "ollama-deepseek-v4.1-flash",
+        "codex-gpt-6.1-sol-medium",
         "zai-glm-5.3-flash",
         "deepseek-deepseek-v4-flash",
         "vllm-dev-Qwen3.8-27B"
@@ -186,8 +234,7 @@
       },
       "systemPrompt": "developer",
       "appendSystemPrompt": [
-        "@~/.claude/pi/prompts/stack/go.md",
-        "@~/.claude/pi/prompts/org/gid-go.md"
+        "@~/.claude/pi/prompts/stack/go.md"
       ],
       "mounts": [
         "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/git-commit:/pi-skills/git-commit:ro",
@@ -211,8 +258,7 @@
       },
       "tags": [
         "go",
-        "dev",
-        "gid.team"
+        "dev"
       ],
       "description": "Go-задача целиком: прод-код, юнит-тесты, гейты, коммит",
       "thinking": "low"
@@ -220,7 +266,9 @@
     {
       "id": "go-qa",
       "models": [
-        "zai-glm-5.3-flash",
+        "ollama-deepseek-v4.1-flash",
+        "codex-gpt-6.1-terra-medium",
+        "zai-glm-5.3",
         "deepseek-deepseek-v4-flash",
         "vllm-Qwen3.8-27B"
       ],
@@ -232,8 +280,7 @@
       },
       "systemPrompt": "qa",
       "appendSystemPrompt": [
-        "@~/.claude/pi/prompts/stack/go.md",
-        "@~/.claude/pi/prompts/org/gid-go.md"
+        "@~/.claude/pi/prompts/stack/go.md"
       ],
       "mounts": [
         "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/git-commit:/pi-skills/git-commit:ro",
@@ -251,8 +298,7 @@
       },
       "tags": [
         "go",
-        "qa",
-        "gid.team"
+        "qa"
       ],
       "description": "Проверяет готовую Go-работу: пишет только интеграционные и E2E, прод-код не трогает",
       "thinking": "low"
@@ -262,6 +308,10 @@
       "description": "Rust-задача целиком: прод-код, юнит-тесты, гейты, коммит",
       "thinking": "off",
       "models": [
+        "ollama-deepseek-v4.1-flash",
+        "codex-gpt-6.1-sol-medium",
+        "zai-glm-5.3-flash",
+        "deepseek-deepseek-v4-flash",
         "vllm-dev-Qwen3.8-27B"
       ],
       "sandboxService": {
@@ -297,6 +347,10 @@
       "description": "Проверяет готовую Rust-работу: только tests/ и E2E против бинаря, прод-код не трогает",
       "thinking": "low",
       "models": [
+        "ollama-deepseek-v4.1-flash",
+        "codex-gpt-6.1-terra-medium",
+        "zai-glm-5.3",
+        "deepseek-deepseek-v4-flash",
         "vllm-Qwen3.8-27B"
       ],
       "sandboxService": {
@@ -332,6 +386,8 @@
       "description": "Фронтенд TypeScript/Vue целиком: код, юнит-тесты, гейты, коммит",
       "thinking": "low",
       "models": [
+        "ollama-deepseek-v4.1-flash",
+        "codex-gpt-6.1-sol-medium",
         "zai-glm-5.3-flash",
         "deepseek-deepseek-v4-flash",
         "vllm-dev-Qwen3.8-27B"
@@ -371,7 +427,9 @@
       "description": "Проверяет готовый фронтенд: только тесты и E2E против артефакта, прод-код не трогает",
       "thinking": "low",
       "models": [
-        "zai-glm-5.3-flash",
+        "ollama-deepseek-v4.1-flash",
+        "codex-gpt-6.1-terra-medium",
+        "zai-glm-5.3",
         "deepseek-deepseek-v4-flash",
         "vllm-Qwen3.8-27B"
       ],
@@ -408,6 +466,8 @@
     {
       "id": "python-developer",
       "models": [
+        "ollama-deepseek-v4.1-flash",
+        "codex-gpt-6.1-sol-medium",
         "zai-glm-5.3-flash",
         "deepseek-deepseek-v4-flash",
         "vllm-dev-Qwen3.8-27B"
@@ -447,7 +507,9 @@
       "description": "Проверяет готовую Python-работу: только pytest и E2E против стенда, прод-код не трогает",
       "thinking": "low",
       "models": [
-        "zai-glm-5.3-flash",
+        "ollama-deepseek-v4.1-flash",
+        "codex-gpt-6.1-terra-medium",
+        "zai-glm-5.3",
         "deepseek-deepseek-v4-flash",
         "vllm-Qwen3.8-27B"
       ],
@@ -484,7 +546,10 @@
       "description": "Ревью диффа: находки с якорями path:line и воспроизведением, правок не пишет",
       "thinking": "high",
       "models": [
-        "zai-glm-5.3"
+        "codex-gpt-6-astra-high",
+        "ollama-glm-5.3",
+        "zai-glm-5.3",
+        "vllm-Qwen3.8-27B"
       ],
       "sandboxService": {
         "id": "agent",
@@ -514,7 +579,10 @@
       "description": "Исследует вопрос по коду и внешним источникам, отвечает с якорями; LSP, дочерние агенты",
       "thinking": "high",
       "models": [
-        "zai-glm-5.3-flash"
+        "ollama-glm-5.3",
+        "zai-glm-5.3",
+        "codex-gpt-6.1-sol-high",
+        "vllm-Qwen3.8-27B"
       ],
       "sandboxService": {
         "id": "agent-lite",
@@ -546,7 +614,10 @@
       "description": "Сверяет тесты со спекой, не читая реализацию: что не проверено ни одним тестом",
       "thinking": "high",
       "models": [
-        "zai-glm-5.3-flash"
+        "codex-gpt-6-astra-high",
+        "ollama-glm-5.3",
+        "zai-glm-5.3",
+        "vllm-Qwen3.8-27B"
       ],
       "sandboxService": {
         "id": "agent-lite",
@@ -560,6 +631,84 @@
       "tags": [
         "audit",
         "blind"
+      ]
+    },
+    {
+      "id": "ruby-developer",
+      "models": [
+        "ollama-deepseek-v4.1-flash",
+        "codex-gpt-6.1-sol-medium",
+        "zai-glm-5.3-flash",
+        "deepseek-deepseek-v4-flash",
+        "vllm-dev-Qwen3.8-27B"
+      ],
+      "sandboxService": {
+        "id": "agent",
+        "env": [
+          "PI_HOOKS=goimports-on-edit,go-cache-guard,custom-gcl-precommit,git-commit-guard,git-stash-guard,protect-secrets,sql-semicolon-guard,output-hygiene,grep-scope-guard,protect-pi-hooks"
+        ]
+      },
+      "systemPrompt": "developer",
+      "appendSystemPrompt": [
+        "@~/.claude/pi/prompts/stack/ruby.md"
+      ],
+      "mounts": [
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/git-commit:/pi-skills/git-commit:ro",
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/testing-principles:/pi-skills/testing-principles:ro"
+      ],
+      "skills": [
+        "/pi-skills/git-commit",
+        "/pi-skills/testing-principles"
+      ],
+      "timeoutMs": 10800000,
+      "git": {
+        "name": "pi ruby-developer",
+        "email": "pi-agent@localhost"
+      },
+      "tags": [
+        "rb",
+        "dev"
+      ],
+      "description": "Ruby-задача целиком: прод-код, юнит-тесты, гейты, коммит",
+      "thinking": "low"
+    },
+    {
+      "id": "ruby-qa",
+      "description": "Проверяет готовую Ruby-работу: только тесты и E2E против стенда, прод-код не трогает",
+      "thinking": "low",
+      "models": [
+        "ollama-deepseek-v4.1-flash",
+        "codex-gpt-6.1-terra-medium",
+        "zai-glm-5.3",
+        "deepseek-deepseek-v4-flash",
+        "vllm-Qwen3.8-27B"
+      ],
+      "sandboxService": {
+        "id": "agent",
+        "env": [
+          "PI_HOOKS=goimports-on-edit,go-cache-guard,custom-gcl-precommit,git-commit-guard,git-stash-guard,protect-secrets,sql-semicolon-guard,output-hygiene,grep-scope-guard,protect-pi-hooks,test-only-guard"
+        ]
+      },
+      "systemPrompt": "qa",
+      "appendSystemPrompt": [
+        "@~/.claude/pi/prompts/stack/ruby.md"
+      ],
+      "mounts": [
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/git-commit:/pi-skills/git-commit:ro",
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/testing-principles:/pi-skills/testing-principles:ro"
+      ],
+      "skills": [
+        "/pi-skills/git-commit",
+        "/pi-skills/testing-principles"
+      ],
+      "timeoutMs": 10800000,
+      "git": {
+        "name": "pi ruby-qa",
+        "email": "pi-agent@localhost"
+      },
+      "tags": [
+        "rb",
+        "qa"
       ]
     }
   ]

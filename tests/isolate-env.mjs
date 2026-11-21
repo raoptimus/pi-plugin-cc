@@ -12,3 +12,9 @@
 for (const key of Object.keys(process.env)) {
   if (key.startsWith("PI_OTEL_") || key.startsWith("OTEL_EXPORTER")) delete process.env[key];
 }
+
+// The personal config moved to `$XDG_CONFIG_HOME/pia/config.json`, and a test
+// that isolates HOME by itself would still read the developer's real fleet when
+// the shell exports XDG_CONFIG_HOME. Clearing it here makes the HOME a test sets
+// the whole answer; tests that exercise the XDG path set it themselves.
+delete process.env.XDG_CONFIG_HOME;

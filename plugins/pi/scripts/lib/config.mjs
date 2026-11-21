@@ -14,16 +14,25 @@ import { DEFAULT_CACHE_TTL } from "./sessions.mjs";
  *
  * Layering, lowest priority first:
  *   1. built-in defaults below
- *   2. user config    ~/.claude/pi/config.json
+ *   2. user config    $XDG_CONFIG_HOME/pia/config.json  (or ~/.config/pia/config.json)
  *   3. project config <workspace>/.claude/pi/config.json
  *   4. command line flags (applied by the caller)
+ *
+ * The user layer used to live only at ~/.claude/pi/config.json, a directory
+ * shared with Claude Code and written by whatever else owns it. It moved to the
+ * XDG location, which belongs to pia alone and is writable on a machine without
+ * Claude Code. The old file is still honoured when the new one is absent, read
+ * as a whole layer — never merged with the canonical file, because two layers
+ * of the same rank make every resolved value depend on which file happened to
+ * exist, and a half-migrated machine would silently run a blend of both.
  *
  * Layers merge field by field, so a project can tune one detail of a global
  * preset — a model, an extra mount — without restating the whole thing. See
  * `mergeConfigLayer` for what "tune" means per field type.
  */
 
-export const USER_CONFIG_RELATIVE = path.join(".claude", "pi", "config.json");
+export const LEGACY_USER_CONFIG_RELATIVE = path.join(".claude", "pi", "config.json");
+export const USER_CONFIG_RELATIVE = path.join("pia", "config.json");
 export const PROJECT_CONFIG_RELATIVE = path.join(".claude", "pi", "config.json");
 
 const BUILT_IN = {
@@ -452,8 +461,54 @@ function poolOfModel(pools, id) {
   return null;
 }
 
+/**
+ * The canonical personal config: `$XDG_CONFIG_HOME/pia/config.json`.
+ *
+ * XDG says a relative value is to be ignored, and an installer that honoured a
+ * relative one would write next to the current directory instead of into the
+ * home — so an unusable value falls back to `~/.config`.
+ */
+export function canonicalUserConfigPath() {
+  const xdg = process.env.XDG_CONFIG_HOME;
+  const base = xdg && path.isAbsolute(xdg) ? xdg : path.join(os.homedir(), ".config");
+  return path.join(base, USER_CONFIG_RELATIVE);
+}
+
+/** Where the user config lived before pia had a directory of its own. */
+export function legacyUserConfigPath() {
+  return path.join(os.homedir(), LEGACY_USER_CONFIG_RELATIVE);
+}
+
+/**
+ * Presence of the path itself, not of what it resolves to: a dangling symlink
+ * is a configuration someone made on purpose, and treating it as "no config"
+ * would silently fall back to the old file it was meant to replace — the exact
+ * shadowing the installer refuses to create.
+ */
+function existsAt(filePath) {
+  try {
+    fs.lstatSync(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The user config that actually applies: canonical when present, the legacy
+ * file otherwise, and the canonical path when neither exists — so a message
+ * telling the owner where to add presets names the file to create.
+ *
+ * Presence is decided here once, so `loadConfig` and every report agree on
+ * which file was read; two paths must never both contribute.
+ */
 export function userConfigPath() {
-  return path.join(os.homedir(), USER_CONFIG_RELATIVE);
+  const canonical = canonicalUserConfigPath();
+  if (existsAt(canonical)) {
+    return canonical;
+  }
+  const legacy = legacyUserConfigPath();
+  return existsAt(legacy) ? legacy : canonical;
 }
 
 export function projectConfigPath(workspaceRoot) {
@@ -461,7 +516,7 @@ export function projectConfigPath(workspaceRoot) {
 }
 
 function readJsonFile(filePath) {
-  if (!filePath || !fs.existsSync(filePath)) {
+  if (!filePath || !existsAt(filePath)) {
     return { value: null, error: null };
   }
   try {

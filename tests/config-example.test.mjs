@@ -96,3 +96,87 @@ test("the example config carries no secret and no path of one machine", () => {
     .filter((line) => /[A-Za-z0-9]{32,}/.test(line) && !line.includes("CAPABILITY_CEILING"));
   assert.deepEqual(suspicious, [], "no line looks like a key or a token");
 });
+
+test("the example fleet has one role per job and vLLM as the last resort", () => {
+  const config = normalizeConfigLayer(parsed);
+  const roles = Object.keys(config.presets).sort();
+  assert.deepEqual(roles, [
+    "coverage-auditor",
+    "go-developer",
+    "go-qa",
+    "python-developer",
+    "python-qa",
+    "researcher",
+    "reviewer",
+    "ruby-developer",
+    "ruby-qa",
+    "rust-developer",
+    "rust-qa",
+    "web-developer",
+    "web-qa"
+  ]);
+
+  // The order is the whole point of the list: the first candidate with a free
+  // slot wins, so a vLLM model anywhere but last would spend the local GPU while
+  // a paid account sat idle — and the local one is the fallback for when every
+  // account is out of money.
+  for (const [name, preset] of Object.entries(config.presets)) {
+    assert.ok(preset.models.length >= 1, `${name} lists at least one model`);
+    const last = preset.models[preset.models.length - 1];
+    assert.match(last, /^vllm-/, `${name} puts vLLM last, got ${last}`);
+  }
+
+  // Rust lists a direct DeepSeek variant of its own, not only what it inherits
+  // from the shared pools.
+  for (const name of ["rust-developer", "rust-qa"]) {
+    assert.ok(
+      config.presets[name].models.includes("deepseek-deepseek-v4-flash"),
+      `${name} lists the direct DeepSeek model`
+    );
+  }
+});
+
+test("every model id in the example resolves to one pool and one provider", () => {
+  const config = normalizeConfigLayer(parsed);
+  const pools = Object.keys(config.concurrencyPools);
+  const providerOfPool = new Map();
+
+  for (const poolName of pools) {
+    // One provider per pool is what makes the slot limit mean anything: two
+    // accounts under one limit would each be capped by the other's usage.
+    for (const record of Object.values(config.concurrencyPools[poolName].models ?? {})) {
+      const seen = providerOfPool.get(poolName);
+      if (seen) {
+        assert.equal(record.provider, seen, `pool ${poolName} holds one provider`);
+      } else {
+        providerOfPool.set(poolName, record.provider);
+      }
+    }
+  }
+
+  const providers = [...providerOfPool.values()];
+  assert.equal(new Set(providers).size, providers.length, "pools name distinct providers");
+
+  // A preset names a model by id; an id nobody owns fails at the first variant
+  // of the first run instead of at review time.
+  for (const [name, preset] of Object.entries(config.presets)) {
+    for (const id of preset.models) {
+      const owners = pools.filter((pool) => config.concurrencyPools[pool].models?.[id]);
+      assert.equal(owners.length, 1, `${name}: model ${id} belongs to exactly one pool`);
+    }
+  }
+
+  // vLLM is the last resort in the ordering too: its pool ranks below every
+  // account-backed one. A pool that states no priority sorts last, so it cannot
+  // outrank anything.
+  const priorityOf = (poolName) => config.concurrencyPools[poolName].priority ?? -Infinity;
+  const vllmPriority = priorityOf("vllm");
+  for (const poolName of pools) {
+    if (poolName !== "vllm") {
+      assert.ok(
+        priorityOf(poolName) >= vllmPriority,
+        `pool ${poolName} does not outrank vllm`
+      );
+    }
+  }
+});

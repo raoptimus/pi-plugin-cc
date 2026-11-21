@@ -430,7 +430,7 @@ function usage() {
     "  --model <id>            model id or pattern (provider/model[:thinking])",
     "  --provider <name>       provider name",
     "  --thinking <level>      off|minimal|low|medium|high|xhigh|max",
-    "  --preset <name>         preset from .claude/pi/config.json",
+    "  --preset <name>         preset from the pia config ($XDG_CONFIG_HOME/pia/config.json)",
     "  --no-fallback           keep the named preset even if the journal calls it dead",
     "  --system-prompt <v>     stored prompt name (reviewer, fixer, …), @path/to.md, or inline text",
     "  --append-system-prompt  additive prompt text or file (repeatable)",
