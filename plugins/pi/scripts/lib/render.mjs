@@ -108,7 +108,7 @@ export function renderSetupReport(report) {
 export function presetLines(presets, capabilities = {}, limits = {}, plans = {}) {
   const names = Object.keys(presets ?? {});
   if (!names.length) {
-    return ["- none configured (add a `presets` block to `.claude/pi/config.json`)"];
+    return ["- none configured (add a `presets` block to `$XDG_CONFIG_HOME/pia/config.json`)"];
   }
   return names.map((name) => {
     const preset = presets[name] ?? {};

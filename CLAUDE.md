@@ -89,7 +89,9 @@ the run forwards them into the live session as `steer`, `follow_up` or `abort`.
 ### Config and presets
 
 `lib/config.mjs` layers, lowest first: built-in defaults → user config → project config
-(`.claude/pi/config.json` in the home directory and in the workspace respectively) → flags. Layers
+(`$XDG_CONFIG_HOME/pia/config.json`, or `~/.config/pia/config.json` when unset, and
+`.claude/pi/config.json` in the workspace respectively) → flags. The pre-XDG `~/.claude/pi/config.json`
+is read as the user layer only when the canonical file is absent — never merged with it. Layers
 merge field by field (`mergeConfigLayer`), so a project can retune one field of a global preset.
 A **preset** is a complete agent profile: model, thinking, system prompt, tools, extensions, skills,
 sandbox, limits. `sanitizeProjectLayer` is what a project layer is allowed to set — treat it as a

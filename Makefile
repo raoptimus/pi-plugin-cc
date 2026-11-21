@@ -25,7 +25,7 @@ PI_SANDBOX  ?= $(HOME)/.claude/pi/sandbox
 SANDBOX_DIR := $(ROOT)/plugins/$(PLUGIN)/sandbox
 
 .DEFAULT_GOAL := help
-.PHONY: help install update check-marketplace update-cc update-pi uninstall reinstall validate test status link
+.PHONY: help install update check-marketplace update-cc update-pi uninstall reinstall validate test status link install-pia-example
 
 help: ## List the targets
 	@awk 'BEGIN{FS=":.*##"} /^[a-z-]+:.*##/ {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -164,6 +164,45 @@ link: ## Point `pia` in PATH at this checkout
 	@mkdir -p "$(BIN_DIR)"
 	ln -sfn "$(ROOT)/bin/pia" "$(BIN_DIR)/pia"
 	@echo "$(BIN_DIR)/pia -> $(ROOT)/bin/pia"
+
+# The example config used to be a copy-by-hand into `~/.claude/pi/config.json` —
+# a directory shared with Claude Code, which pia only borrowed and which does not
+# exist on a machine that has no Claude Code. The canonical user config is now
+# `$XDG_CONFIG_HOME/pia/config.json`; this target writes it and points the old
+# path at it with a symlink, so both spellings address one file.
+#
+# It refuses rather than overwrites, on either path. A config is the owner's
+# work, and an installer that re-copied the example over it would undo a tuned
+# fleet while reporting success. Both checks use `-e` AND `-L`: `-e` sees through
+# a symlink and calls a dangling one absent, and a dangling legacy symlink is
+# exactly what a moved or deleted config leaves behind — writing over it would
+# silently shadow whatever the owner meant to keep.
+#
+# Not part of `update`: writing into the home is always the owner's explicit
+# step, never a side effect of refreshing the plugin.
+install-pia-example: ## Install the example fleet as the user config (0600), link the old path
+	@xdg="$${XDG_CONFIG_HOME:-}"; \
+	case "$$xdg" in /*) ;; *) xdg="$(HOME)/.config" ;; esac; \
+	canonical="$$xdg/pia/config.json"; \
+	legacy="$(HOME)/.claude/pi/config.json"; \
+	if [ -e "$$canonical" ] || [ -L "$$canonical" ]; then \
+		echo "pia-config: FATAL — $$canonical already exists; not touching it"; \
+		exit 1; \
+	fi; \
+	if [ -e "$$legacy" ] || [ -L "$$legacy" ]; then \
+		echo "pia-config: FATAL — $$legacy already exists (a dangling symlink counts); not shadowing it"; \
+		exit 1; \
+	fi; \
+	mkdir -p "$$xdg/pia" "$$(dirname "$$legacy")" || exit 1; \
+	umask 077; \
+	tmp=$$(mktemp "$$xdg/pia/.example.XXXXXXXX") || exit 1; \
+	trap 'rm -f "$$tmp"' EXIT; \
+	cp "$(PLUGIN_DIR)/config.example.json" "$$tmp" && chmod 600 "$$tmp" || exit 1; \
+	node -e 'require("node:fs").linkSync(...process.argv.slice(1))' "$$tmp" "$$canonical" || exit 1; \
+	node -e 'require("node:fs").symlinkSync(...process.argv.slice(1))' "$$canonical" "$$legacy" || { \
+		[ ! "$$tmp" -ef "$$canonical" ] || rm -f "$$canonical"; exit 1; }; \
+	echo "pia-config: $$canonical (0600)"; \
+	echo "pia-config: $$legacy -> $$canonical"
 
 status: ## Installation state and what the plugin contains
 	@$(CLAUDE) plugin list 2>/dev/null | grep -A3 '$(PLUGIN)@$(MARKETPLACE)' || echo "  plugin not installed"

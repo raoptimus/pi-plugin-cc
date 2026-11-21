@@ -17,7 +17,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" delegate [flags] "<task te
 Useful flags:
 
 - `--model <id>` / `--provider <name>` / `--thinking <off|minimal|low|medium|high|xhigh|max>` — model selection.
-- `--preset <name>` — a full agent profile from `.claude/pi/config.json` (model, thinking, prompt, tools, extensions).
+- `--preset <name>` — a full agent profile from the pia config (`$XDG_CONFIG_HOME/pia/config.json`, or the older `~/.claude/pi/config.json` while the new one is absent): model, thinking, prompt, tools, extensions.
 - `--system-prompt <name|@file|text>` — the system prompt: a stored name (`fixer`, `reviewer`, `adversarial`, `explorer`), a file, or inline text. Default is pi's own coding-assistant prompt.
 - `--append-system-prompt <text|@file>` — extend the prompt without replacing it.
 - `--extension <source>` / `--skill <path>` — give the agent more tools (e.g. `npm:pi-mcp-adapter` for MCP).

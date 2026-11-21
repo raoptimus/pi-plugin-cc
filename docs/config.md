@@ -3,9 +3,11 @@
 How layers merge, what a project is allowed to override, and how to tune a global preset for
 one repository. The skill keeps only what is needed at launch time.
 
-Optional. `~/.claude/pi/config.json` holds personal defaults, `<repo>/.claude/pi/config.json` project ones — the project file wins, and command-line flags win over both.
+Optional. `$XDG_CONFIG_HOME/pia/config.json` (or `~/.config/pia/config.json` when `XDG_CONFIG_HOME` is unset or relative — XDG says a relative value is to be ignored) holds personal defaults, `<repo>/.claude/pi/config.json` project ones — the project file wins, and command-line flags win over both.
 
-**Starting from scratch:** `plugins/pi/config.example.json` is a whole working fleet in the current form — eleven roles, three sandbox services, three provider pools — with every secret and machine path replaced by a placeholder. Copy it to `~/.claude/pi/config.json`, put your own token behind `gitProxy.*.tokenCommand`, point the mounts at paths that exist on your machine, and `pia presets` answers with a fleet instead of nothing. It is generated from a live config, so it stays a working shape rather than a minimal sketch; the config itself is never in this repository (it holds the owner's tokens and decisions).
+**The old path still works, as a whole file.** `~/.claude/pi/config.json` predates pia having a directory of its own and is still read *when the XDG file is absent*; the two are never merged. Two layers of the same rank would make every resolved value depend on which file happened to exist, so a half-migrated machine would run a blend of both. Nothing migrates automatically either: `make install-pia-example` writes the canonical file and symlinks the old path to it, and it refuses if either path is already there (a dangling symlink included) rather than overwrite a fleet.
+
+**Starting from scratch:** `plugins/pi/config.example.json` is a whole working fleet in the current form — thirteen roles (Go, Rust, TypeScript/Vue, Python, Ruby, review, research, coverage audit), three sandbox services, five provider pools — with credentials left out (`gitProxy` is empty) and the mounts still naming the author's layout. `make install-pia-example` copies it to the canonical path with `0600` and links the old path to it, refusing on either path that already exists; by hand, copy it to `$XDG_CONFIG_HOME/pia/config.json`, put your own token behind `gitProxy.*.tokenCommand`, point the mounts at paths that exist on your machine, and `pia presets` answers with a fleet instead of nothing. It is generated from a live config, so it stays a working shape rather than a minimal sketch; the config itself is never in this repository (it holds the owner's tokens and decisions).
 
 ```json
 {
